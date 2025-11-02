@@ -702,9 +702,9 @@ async def back_to_start_callback(callback: CallbackQuery):
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Каталог 🛒", callback_data="catalog")],
-            [InlineKeyboardButton(text="Пополнение ??", callback_data="recharge"),
-             InlineKeyboardButton(text="Помощь ??", callback_data="help")],
-            [InlineKeyboardButton(text="Промокоды ??", callback_data="promo"),
+            [InlineKeyboardButton(text="Пополнение 🏦", callback_data="recharge"),
+             InlineKeyboardButton(text="Помощь ⁉️", callback_data="help")],
+            [InlineKeyboardButton(text="Промокоды 🎟️", callback_data="promo"),
              InlineKeyboardButton(text="Мой профиль 👤", callback_data="profile")]
         ]
     )
