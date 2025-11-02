@@ -1,0 +1,7 @@
+/.env
+/shop.db
+/photos
+/venv
+/__pycache__/
+*.pyc
+__pycache__/db_helpers.cpython-313.pyc
