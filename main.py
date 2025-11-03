@@ -12,7 +12,30 @@ from aiogram.fsm.state import State, StatesGroup
 from datetime import datetime
 import functools
 import aiohttp
-from typing import Optional, Any
+from typing import Optional, Any, List
+# попытка импортировать реальную библиотеку; если её нет — создаём заглушку
+try:
+    from AsyncPayments.cryptoBot import AsyncCryptoBot  # type: ignore
+    CRYPTO_AVAILABLE = True
+except Exception:
+    CRYPTO_AVAILABLE = False
+
+    class AsyncCryptoBot:
+        """
+        Заглушка для AsyncCryptoBot, используется если библиотека не установлена.
+        Методы возвращают значения, обозначающие, что платёжная система не настроена.
+        """
+        def __init__(self, token: str, is_testnet: bool = True):
+            self.token = token
+            self.is_testnet = is_testnet
+
+        async def create_invoice(self, *args, **kwargs):
+            # Возвращаем "пустой" объект/словарь — create_cryptopay_invoice вернёт None
+            return {"invoice_id": None, "pay_url": None}
+
+        async def get_invoices(self, *args, **kwargs):
+            # Возвращаем пустой список — check_crypto_invoice вернёт "not"
+            return []
 
 from db_helpers import (
     init_db, add_user, get_categories, add_category, add_product,
@@ -90,6 +113,8 @@ class AddProductState(StatesGroup):
     waiting_for_description = State()
     waiting_for_price = State()
     waiting_for_photo = State()
+    waiting_for_autodelivery_choice = State()    # new: ask admin yes/no
+    waiting_for_autodelivery_content = State()   # new: accept text or file
 
 # Состояния для управления категориями и товарами
 class AdminState(StatesGroup):
@@ -168,28 +193,121 @@ async def process_product_price(message: Message, state: FSMContext):
     await message.reply("Отправьте фотографию товара:")
     await state.set_state(AddProductState.waiting_for_photo)
 
+# Изменение обработчика сохранения фото товара (последний определённый в файле) --
+# после добавления товара для админа спрашиваем про автовыдачу и сохраняем product_id в state
 @dp.message(AddProductState.waiting_for_photo, F.content_type == "photo")
 async def process_product_photo(message: Message, state: FSMContext):
-    photo = message.photo[-1]  # Берем последнюю (наибольшего размера) фотографию
+    photo = message.photo[-1]
     photo_dir = "photos"
     photo_path = os.path.join(photo_dir, f"{photo.file_id}.jpg")
-
-    # Создаем директорию, если она не существует
     os.makedirs(photo_dir, exist_ok=True)
-
-    # Сохраняем фотографию локально через bot.download_file
     file = await bot.get_file(photo.file_id)
     await bot.download_file(file.file_path, destination=photo_path)
 
     data = await state.get_data()
+    # сохраняем товар в БД
     add_product(data["name"], data["description"], data["price"], data["category_id"], photo_path)
-    await message.reply(f"Товар '{data['name']}' добавлен.")
-    await state.clear()
-    # если админ — вернуть в админ-панель, иначе в главное меню
+
+    # попытка найти id добавленного товара (по name, price, category_id и photo_path)
+    products = get_products_by_category(data["category_id"])
+    product_id = None
+    for p in products[::-1]:  # перебираем с конца, чтобы взять последний добавленный
+        pid = p[0]
+        pname = p[1]
+        pprice = p[3] if len(p) > 3 else None
+        pphoto = p[4] if len(p) > 4 else None
+        if pname == data["name"] and pprice == data["price"] and (pphoto == photo_path or pphoto is None):
+            product_id = pid
+            break
+
+    await message.reply(f"Товар '{data['name']}' добавлен. ID={product_id if product_id else 'неизвестен'}.")
+
+    # если админ — спрашиваем про автовыдачу, иначе завершаем
     if message.from_user and message.from_user.id in ADMIN_IDS:
-        await send_admin_menu(message.chat.id, message)
+        if product_id:
+            await state.update_data(product_id=product_id)
+            await message.reply("Включить автовыдачу для этого товара? (да/нет)")
+            await state.set_state(AddProductState.waiting_for_autodelivery_choice)
+            return
+        else:
+            # не нашли id — всё равно возвращаем в админ-панель
+            await send_admin_menu(message.chat.id, message)
+            await state.clear()
+            return
     else:
+        await state.clear()
         await send_main_menu(message.chat.id, message)
+
+# Обработчик выбора включить/выключить автовыдачу
+@dp.message(AddProductState.waiting_for_autodelivery_choice)
+async def process_autodelivery_choice(message: Message, state: FSMContext):
+    ans = message.text.strip().lower()
+    data = await state.get_data()
+    product_id = data.get("product_id")
+    if not product_id:
+        await message.reply("Не удалось определить товар. Возвращаю в админ-панель.")
+        await state.clear()
+        await send_admin_menu(message.chat.id, message)
+        return
+
+    if ans in ("да", "yes", "y"):
+        await message.reply("Отправьте текстовое содержимое автовыдачи или файл (документ/фото).")
+        await state.set_state(AddProductState.waiting_for_autodelivery_content)
+        return
+    else:
+        # записать выключенную автодоставку
+        create_autodelivery(product_id, 0, None, None)
+        await message.reply("Автовыдача отключена для этого товара.")
+        await state.clear()
+        await send_admin_menu(message.chat.id, message)
+
+# Обработчик текстовой автодоставки
+@dp.message(AddProductState.waiting_for_autodelivery_content, F.content_type == "text")
+async def process_autodelivery_text(message: Message, state: FSMContext):
+    content = message.text.strip()
+    data = await state.get_data()
+    product_id = data.get("product_id")
+    if not product_id:
+        await message.reply("Не найден товар. Отмена.")
+        await state.clear()
+        await send_admin_menu(message.chat.id, message)
+        return
+    create_autodelivery(product_id, 1, content, None)
+    await message.reply("Автовыдача настроена (текст).")
+    await state.clear()
+    await send_admin_menu(message.chat.id, message)
+
+# Обработчик файловой автодоставки (photo/document)
+@dp.message(AddProductState.waiting_for_autodelivery_content, F.content_type.in_(["document", "photo"]))
+async def process_autodelivery_file(message: Message, state: FSMContext):
+    data = await state.get_data()
+    product_id = data.get("product_id")
+    if not product_id:
+        await message.reply("Не найден товар. Отмена.")
+        await state.clear()
+        await send_admin_menu(message.chat.id, message)
+        return
+
+    files_dir = "autodeliver_files"
+    os.makedirs(files_dir, exist_ok=True)
+    file_path = None
+
+    if message.content_type == "photo":
+        ph = message.photo[-1]
+        file = await bot.get_file(ph.file_id)
+        file_path = os.path.join(files_dir, f"{ph.file_id}.jpg")
+        await bot.download_file(file.file_path, destination=file_path)
+    elif message.content_type == "document":
+        doc = message.document
+        file = await bot.get_file(doc.file_id)
+        # сохраняем с оригинальным именем для удобства
+        file_path = os.path.join(files_dir, f"{doc.file_id}_{doc.file_name}")
+        await bot.download_file(file.file_path, destination=file_path)
+
+    create_autodelivery(product_id, 1, None, file_path)
+    await message.reply("Автовыдача настроена (файл).")
+    await state.clear()
+    await send_admin_menu(message.chat.id, message)
 
 # Вспомогательная функция: редактировать существующее сообщение в чате или отправить новое и сохранить id
 async def send_or_edit(chat_id: int, source_obj, text: str = None, photo_path: str = None,
@@ -335,37 +453,171 @@ async def product_navigation_callback(callback: CallbackQuery):
 
     await show_product(callback, products, index, category_id)
 
-# Callback: покупка (создаём запись покупки и даём ссылку на оплату)
+# Заменяем/обновляем обработчик покупки: сразу создаём инвойс через CryptoPay (или выполняем автодоставку)
 @dp.callback_query(F.data.startswith("buy_"))
 async def handle_buy_callback(callback: CallbackQuery):
+	try:
+		product_id = int(callback.data.split("_", 1)[1])
+	except ValueError:
+		await callback.answer("Неверный ID товара.", show_alert=True)
+		return
+
+	product = get_product_by_id(product_id)
+	if not product:
+		await send_or_edit(callback.message.chat.id, callback, text="Товар не найден.")
+		await callback.answer()
+		await send_main_menu(callback.message.chat.id, callback)
+		return
+
+	_, name, _, price = product
+
+	# создаём запись заказа
+	purchase_id = create_purchase(callback.from_user.id, product_id)
+
+	# если включена автодоставка — выполняем её сразу
+	autodel = get_autodelivery_for_product(product_id)
+	if autodel and autodel[1] == 1:
+		_, _, content_text, file_path = autodel
+		try:
+			if content_text:
+				await bot.send_message(chat_id=callback.from_user.id, text=f"Автовыдача по заказу {purchase_id} — {name}:\n\n{content_text}")
+			elif file_path:
+				ext = os.path.splitext(file_path)[1].lower()
+				if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
+					await bot.send_photo(chat_id=callback.from_user.id, photo=FSInputFile(file_path), caption=f"Автовыдача по заказу {purchase_id} — {name}")
+				else:
+					await bot.send_document(chat_id=callback.from_user.id, document=FSInputFile(file_path), caption=f"Автовыдача по заказу {purchase_id} — {name}")
+			await callback.message.reply(f"Заказ создан (ID: {purchase_id}). Автовыдача выполнена.")
+		except Exception:
+			await callback.message.reply(f"Заказ создан (ID: {purchase_id}). Возникла ошибка при автодоставке — свяжитесь с поддержкой.")
+		await callback.answer()
+		await send_main_menu(callback.message.chat.id, callback)
+		return
+
+	# иначе — создаём инвойс через CryptoPay и отправляем ссылку
+	pay_link = await create_cryptopay_invoice(amount=price, order_id=purchase_id, description=f"Order {purchase_id}: {name}")
+	if pay_link:
+		await callback.message.reply(f"Заказ создан (ID: {purchase_id}). Для оплаты перейдите по ссылке: {pay_link}")
+	else:
+		await callback.message.reply("Платёжная система не настроена или возникла ошибка при создании инвойса. Свяжитесь с поддержкой.")
+	await callback.answer()
+	await send_main_menu(callback.message.chat.id, callback)
+
+# Обработчик: оплатить крипто (создаём инвойс и даём ссылку)
+@dp.callback_query(F.data.startswith("pay_crypto_"))
+async def pay_crypto_callback(callback: CallbackQuery):
     try:
-        product_id = int(callback.data.split("_", 1)[1])
-    except ValueError:
-        await callback.answer("Неверный ID товара.", show_alert=True)
+        _, purchase_id_str, product_id_str = callback.data.split("_")
+        purchase_id = int(purchase_id_str)
+        product_id = int(product_id_str)
+    except Exception:
+        await callback.answer("Ошибка данных.", show_alert=True)
         return
 
     product = get_product_by_id(product_id)
     if not product:
-        await callback.message.reply("Товар не найден.")
+        await send_or_edit(callback.message.chat.id, callback, text="Товар не найден.")
         await callback.answer()
-        await send_main_menu(callback.message.chat.id, callback)
         return
 
     _, name, _, price = product
-    purchase_id = create_purchase(callback.from_user.id, product_id)
-
-    # Попытка создать инвойс через CryptoPay (если настроено)
     pay_link = await create_cryptopay_invoice(amount=price, order_id=purchase_id, description=f"Order {purchase_id}: {name}")
     if pay_link:
-        await callback.message.reply(f"Заказ создан (ID: {purchase_id}). Для оплаты перейдите по ссылке: {pay_link}")
+        # показываем ссылку для оплаты
+        await send_or_edit(callback.message.chat.id, callback, text=f"Перейдите для оплаты: {pay_link}")
+        await callback.answer()
     else:
-        # fallback — инструкцию по пополнению баланса
-        await callback.message.reply(
-            f"Заказ создан (ID: {purchase_id}) на товар '{name}' на сумму {price} ₽.\n"
-            "Для оплаты пополните баланс в разделе «Пополнение» или свяжитесь с поддержкой для согласования оплаты."
-        )
+        await send_or_edit(callback.message.chat.id, callback, text="Платёжная система не настроена. Свяжитесь с поддержкой.")
+        await callback.answer()
+
+# Обработчик: оплатить балансом
+@dp.callback_query(F.data.startswith("pay_balance_"))
+async def pay_balance_callback(callback: CallbackQuery):
+    try:
+        _, purchase_id_str, product_id_str = callback.data.split("_")
+        purchase_id = int(purchase_id_str)
+        product_id = int(product_id_str)
+    except Exception:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+
+    profile = get_user_profile(callback.from_user.id)
+    if not profile:
+        await send_or_edit(callback.message.chat.id, callback, text="Профиль не найден. Невозможно оплатить балансом.")
+        await callback.answer()
+        return
+
+    _, balance = profile
+    product = get_product_by_id(product_id)
+    if not product:
+        await send_or_edit(callback.message.chat.id, callback, text="Товар не найден.")
+        await callback.answer()
+        return
+
+    _, name, _, price = product
+    if balance is None:
+        balance = 0
+
+    if balance < price:
+        await send_or_edit(callback.message.chat.id, callback, text=f"Недостаточно средств на балансе ({balance} ₽). Пополните счёт или выберите другой способ оплаты.")
+        await callback.answer()
+        return
+
+    # списываем баланс
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET balance = COALESCE(balance,0) - ? WHERE telegram_id = ?", (price, callback.from_user.id))
+        conn.commit()
+        conn.close()
+    except Exception:
+        await send_or_edit(callback.message.chat.id, callback, text="Ошибка при списании баланса. Свяжитесь с поддержкой.")
+        await callback.answer()
+        return
+
+    # если есть автодоставка — доставляем, иначе подтверждаем оплату
+    autodel = get_autodelivery_for_product(product_id)
+    if autodel and autodel[1] == 1:
+        _, _, content_text, file_path = autodel
+        try:
+            if content_text:
+                await bot.send_message(chat_id=callback.from_user.id, text=f"Оплата принята. Автовыдача по заказу {purchase_id} — {name}:\n\n{content_text}")
+            elif file_path:
+                ext = os.path.splitext(file_path)[1].lower()
+                if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
+                    await bot.send_photo(chat_id=callback.from_user.id, photo=FSInputFile(file_path), caption=f"Оплата принята. Автовыдача по заказу {purchase_id} — {name}")
+                else:
+                    await bot.send_document(chat_id=callback.from_user.id, document=FSInputFile(file_path), caption=f"Оплата принята. Автовыдача по заказу {purchase_id} — {name}")
+            await send_or_edit(callback.message.chat.id, callback, text=f"Оплата принята, заказ {purchase_id} выполнен.")
+        except Exception:
+            await send_or_edit(callback.message.chat.id, callback, text=f"Оплата принята, но возникла ошибка при доставке. Свяжитесь с поддержкой.")
+    else:
+        await send_or_edit(callback.message.chat.id, callback, text=f"Оплата принята, заказ {purchase_id} оформлен. После обработки вы получите товар.")
     await callback.answer()
-    await send_main_menu(callback.message.chat.id, callback)
+
+# Обработчик: отмена покупки
+@dp.callback_query(F.data.startswith("cancel_buy_"))
+async def cancel_buy_callback(callback: CallbackQuery):
+    try:
+        _, purchase_id_str = callback.data.split("_")
+        purchase_id = int(purchase_id_str)
+    except Exception:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+
+    # Попытка удалить заказ из БД (если таблица существует)
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM purchases WHERE id = ?", (purchase_id,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        # если таблицы/структуры нет — игнорируем
+        pass
+
+    await send_or_edit(callback.message.chat.id, callback, text="Покупка отменена.")
+    await callback.answer()
 
 # Callback: показать профиль пользователя
 @dp.callback_query(F.data == "profile")
@@ -600,29 +852,6 @@ async def process_product_price(message: Message, state: FSMContext):
     await message.reply("Отправьте фотографию товара:")
     await state.set_state(AddProductState.waiting_for_photo)
 
-@dp.message(AddProductState.waiting_for_photo, F.content_type == "photo")
-async def process_product_photo(message: Message, state: FSMContext):
-    photo = message.photo[-1]  # Берем последнюю (наибольшего размера) фотографию
-    photo_dir = "photos"
-    photo_path = os.path.join(photo_dir, f"{photo.file_id}.jpg")
-
-    # Создаем директорию, если она не существует
-    os.makedirs(photo_dir, exist_ok=True)
-
-    # Сохраняем фотографию локально через bot.download_file
-    file = await bot.get_file(photo.file_id)
-    await bot.download_file(file.file_path, destination=photo_path)
-
-    data = await state.get_data()
-    add_product(data["name"], data["description"], data["price"], data["category_id"], photo_path)
-    await message.reply(f"Товар '{data['name']}' добавлен.")
-    await state.clear()
-    # если админ — вернуть в админ-панель, иначе в главное меню
-    if message.from_user and message.from_user.id in ADMIN_IDS:
-        await send_admin_menu(message.chat.id, message)
-    else:
-        await send_main_menu(message.chat.id, message)
-
 # Callback: удалить товар
 @dp.callback_query(F.data == "delete_product")
 @admin_only
@@ -716,6 +945,7 @@ async def process_promo_uses(message: Message, state: FSMContext):
         await message.reply("Нужно число. Попробуйте ещё раз.")
         return
     data = await state.get_data()
+    # Исправлено: корректный тернарный оператор
     uses_db = None if uses == 0 else uses
     create_promo_in_db(data["code"], data["amount"], uses_db)
     await message.reply(f"Промокод '{data['code']}' добавлен: +{data['amount']} ₽, uses_left={uses_db if uses_db is not None else '∞'}.")
@@ -975,10 +1205,99 @@ async def back_to_start_callback(callback: CallbackQuery):
         await send_or_edit(callback.message.chat.id, callback, text="Добро пожаловать! Выберите действие:", reply_markup=start_menu_keyboard())
     await callback.answer()
 
+# --- NEW: таблица автодоставки и helpers
+def ensure_autodeliveries_table():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS autodeliveries (
+        product_id INTEGER PRIMARY KEY,
+        enabled INTEGER DEFAULT 0,
+        content_text TEXT,
+        file_path TEXT,
+        created_at TEXT
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+def create_autodelivery(product_id: int, enabled: int, content_text: Optional[str], file_path: Optional[str]):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT OR REPLACE INTO autodeliveries(product_id, enabled, content_text, file_path, created_at) VALUES (?, ?, ?, ?, ?)",
+        (product_id, enabled, content_text, file_path, datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+def get_autodelivery_for_product(product_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT product_id, enabled, content_text, file_path FROM autodeliveries WHERE product_id = ?", (product_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+# Инициализация клиента AsyncCryptoBot (лениво — при первом вызове)
+crypto_client: Optional[Any] = None
+
+def _get_crypto_client():
+    global crypto_client
+    if crypto_client is None and CRYPTOPAY_TOKEN:
+        try:
+            is_testnet = os.getenv("CRYPTOPAY_TESTNET", "1") not in ("0", "false", "False")
+            crypto_client = AsyncCryptoBot(CRYPTOPAY_TOKEN, is_testnet=is_testnet)
+        except Exception:
+            crypto_client = None
+    return crypto_client
+
+async def create_cryptopay_invoice(amount: float, order_id: Any = None, description: str = "") -> Optional[str]:
+    """
+    Создаёт инвойс через AsyncCryptoBot и возвращает ссылку для оплаты (pay_url) или None.
+    amount — в рублях (скрипт конвертирует в USDT по USDT2RUB_RATE env).
+    """
+    client = _get_crypto_client()
+    if not client:
+        return None
+
+    try:
+        # конвертация RUB -> USDT (настраивается через USDT2RUB_RATE, по умолчанию 80)
+        rate = float(os.getenv("USDT2RUB_RATE", "80"))
+        amount_usdt = max(0.000001, round(float(amount) / rate, 6))
+        # ожидаем, что create_invoice возвращает объект с invoice_id и pay_url (как в примере)
+        invoice = await client.create_invoice(amount=amount_usdt, currency_type="crypto", asset="USDT", description=description)
+        # invoice может быть объектом или dict
+        pay_url = getattr(invoice, "pay_url", None) or invoice.get("pay_url") if isinstance(invoice, dict) else None
+        invoice_id = getattr(invoice, "invoice_id", None) or invoice.get("invoice_id") if isinstance(invoice, dict) else None
+        # опционально: вы можете сохранить invoice_id в БД, связав с purchase_id (если нужно)
+        return pay_url or (invoice_id if invoice_id else None)
+    except Exception:
+        return None
+
+async def check_crypto_invoice(check_id: str) -> str:
+    """
+    Проверяет статус инвойса по его id. Возвращает "paid" или "not".
+    """
+    client = _get_crypto_client()
+    if not client:
+        return "not"
+    try:
+        info = await client.get_invoices(invoice_ids=[check_id], count=1)
+        # ожидаем List-like, где элемент имеет поле status
+        if isinstance(info, List) or isinstance(info, list):
+            item = info[0]
+            status = getattr(item, "status", None) or item.get("status") if isinstance(item, dict) else None
+            return "paid" if status == "paid" else "not"
+        return "not"
+    except Exception:
+        return "not"
+
 # Запуск бота
 async def main():
     init_db()
     ensure_promos_table()   # --- NEW: создаём таблицу промокодов при старте
+    ensure_autodeliveries_table()  # --- NEW: создаём таблицу автодоставки при старте
     logging.info("Bot work../")
     await dp.start_polling(bot)
 
