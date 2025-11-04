@@ -316,14 +316,16 @@ async def process_autodelivery_file(message: Message, state: FSMContext):
 async def send_or_edit(chat_id: int, source_obj, text: str = None, photo_path: str = None,
                        reply_markup: InlineKeyboardMarkup = None, parse_mode: str = None):
     """
-    Попытаться отредактировать предыдущее сообщение в чате (last_message[chat_id]).
-    Если не получилось — попытаться отредактировать исходное сообщение (source_obj.message_id).
-    Если и это не удалось — отправить новое сообщение/фото и сохранять его id.
-    source_obj может быть CallbackQuery или Message.
+    Поведение:
+    - Если в last_message есть предыдущее бот‑сообщение — сначала пробуем его отредактировать.
+      Это позволяет открывать каталог в том же сообщении, что и главное меню.
+    - Если редактирование не удалось (или source_obj — Message и нужно ответить под пользователем),
+      удаляем предыдущее бот‑сообщение и отправляем новое. При ответе на Message отправляем reply_to.
+    - Сохраняем id только что отправленного сообщения в last_message[chat_id].
     """
     prev_mid = last_message.get(chat_id)
 
-    # попытка редактирования сохранённого сообщения
+    # Попытка редактирования уже отправленного ботом сообщения (предпочтительно для callback'ов)
     if prev_mid:
         try:
             if photo_path:
@@ -333,36 +335,54 @@ async def send_or_edit(chat_id: int, source_obj, text: str = None, photo_path: s
                 await bot.edit_message_text(text, chat_id=chat_id, message_id=prev_mid, reply_markup=reply_markup, parse_mode=parse_mode)
             return
         except Exception:
-            # если не удалось отредактировать — продолжим к следующей попытке
+            # если не удалось отредактировать — продолжим к удалению и отправке нового
             pass
 
-    # попытка редактировать исходное сообщение (callback.message или message)
+    # Если сюда дошли — либо prev_mid отсутствует, либо редактирование не удалось.
+    # Удаляем старое сообщение бота (если есть), чтобы соблюсти требование "одного сообщения бота"
+    if prev_mid:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=prev_mid)
+        except Exception:
+            # игнорируем ошибки удаления
+            pass
+        last_message.pop(chat_id, None)
+
+    # Определяем, нужно ли отправлять ответом на сообщение пользователя
+    reply_to = None
     try:
-        src_msg = None
-        if isinstance(source_obj, CallbackQuery):
-            src_msg = source_obj.message
-        elif isinstance(source_obj, Message):
-            src_msg = source_obj
-
-        if src_msg:
-            if photo_path:
-                media = InputMediaPhoto(media=FSInputFile(photo_path), caption=text, parse_mode=parse_mode)
-                await bot.edit_message_media(media=media, chat_id=chat_id, message_id=src_msg.message_id, reply_markup=reply_markup)
-                last_message[chat_id] = src_msg.message_id
-                return
-            else:
-                await bot.edit_message_text(text, chat_id=chat_id, message_id=src_msg.message_id, reply_markup=reply_markup, parse_mode=parse_mode)
-                last_message[chat_id] = src_msg.message_id
-                return
+        if isinstance(source_obj, Message):
+            reply_to = source_obj.message_id
     except Exception:
-        pass
+        reply_to = None
 
-    # если ничего не получилось — отправляем новое сообщение/фото и сохраняем id
-    if photo_path:
-        sent = await bot.send_photo(chat_id=chat_id, photo=FSInputFile(photo_path), caption=text, reply_markup=reply_markup, parse_mode=parse_mode)
-    else:
-        sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode=parse_mode)
-    last_message[chat_id] = sent.message_id
+    sent = None
+    try:
+        if photo_path:
+            if reply_to:
+                sent = await bot.send_photo(chat_id=chat_id, photo=FSInputFile(photo_path),
+                                            caption=text, reply_markup=reply_markup,
+                                            parse_mode=parse_mode, reply_to_message_id=reply_to)
+            else:
+                sent = await bot.send_photo(chat_id=chat_id, photo=FSInputFile(photo_path),
+                                            caption=text, reply_markup=reply_markup,
+                                            parse_mode=parse_mode)
+        else:
+            if reply_to:
+                sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup,
+                                              parse_mode=parse_mode, reply_to_message_id=reply_to)
+            else:
+                sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup,
+                                              parse_mode=parse_mode)
+    except Exception:
+        # fallback: пытаемся отправить простое сообщение без reply_to
+        try:
+            sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+        except Exception:
+            sent = None
+
+    if sent:
+        last_message[chat_id] = sent.message_id
 
 # Callback: показать каталог (с подкаталогами)
 @dp.callback_query(F.data == "catalog")
@@ -541,6 +561,7 @@ async def check_payment_callback(callback: CallbackQuery):
         await callback.answer("Платёж не найден.", show_alert=True)
         return
     _, purchase_id, invoice_id, pay_url, method, status = payment
+
     # проверяем через invoice_id (если есть)
     if invoice_id:
         status_remote = await check_crypto_invoice_status(invoice_id)
@@ -548,11 +569,11 @@ async def check_payment_callback(callback: CallbackQuery):
         status_remote = "not"
 
     if status_remote == "paid":
-        # обновляем статус по id записи платежа
+        # отмечаем оплату
         update_payment_status_by_id(payment_id, "paid")
         mark_purchase_paid(purchase_id)
 
-        # получаем данные покупки для доставки: user_id и product_id
+        # получаем данные покупки: owner и product
         try:
             conn = sqlite3.connect(DB_PATH)
             cur = conn.cursor()
@@ -562,34 +583,48 @@ async def check_payment_callback(callback: CallbackQuery):
         except Exception:
             row = None
 
+        owner_id = None
+        product_id = None
         if row:
-            user_id, product_id = row
-        else:
-            user_id = None
-            product_id = None
+            owner_id, product_id = row
 
-        # выполняем автодоставку, если есть
-        if product_id and user_id:
+        delivered = False
+        # если есть владелец и продукт — пытаемся отправить автодовку
+        if product_id and owner_id:
             autodel = get_autodelivery_for_product(product_id)
             if autodel and autodel[1] == 1:
-                _, _, content_text, file_path = autodel
+                # autodel = (product_id, enabled, content_text, file_path)
                 try:
+                    _, _, content_text, file_path = autodel
                     if content_text:
-                        await bot.send_message(chat_id=user_id, text=f"Оплата принята. Автовыдача по заказу {purchase_id}:\n\n{content_text}")
+                        await bot.send_message(chat_id=owner_id, text=f"Оплата принята. Автовыдача по заказу {purchase_id}:\n\n{content_text}")
+                        delivered = True
                     elif file_path:
                         ext = os.path.splitext(file_path)[1].lower()
                         if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
-                            await bot.send_photo(chat_id=user_id, photo=FSInputFile(file_path), caption=f"Оплата принята. Автовыдача по заказу {purchase_id}")
+                            await bot.send_photo(chat_id=owner_id, photo=FSInputFile(file_path), caption=f"Оплата принята. Автовыдача по заказу {purchase_id}")
                         else:
-                            await bot.send_document(chat_id=user_id, document=FSInputFile(file_path), caption=f"Оплата принята. Автовыдача по заказу {purchase_id}")
-                    await bot.send_message(chat_id=callback.from_user.id, text=f"Оплата подтверждена, заказ {purchase_id} выполнен.")
+                            await bot.send_document(chat_id=owner_id, document=FSInputFile(file_path), caption=f"Оплата принята. Автовыдача по заказу {purchase_id}")
+                        delivered = True
                 except Exception:
-                    await bot.send_message(chat_id=callback.from_user.id, text=f"Оплата подтверждена, но произошла ошибка при доставке. Свяжитесь с поддержкой.")
-                await callback.answer()
-                return
+                    # ошибка при доставке владельцу
+                    try:
+                        await bot.send_message(chat_id=callback.from_user.id, text=f"Оплата принята, но ошибка при автодовке владельцу заказа {purchase_id}. Свяжитесь с поддержкой.")
+                    except Exception:
+                        pass
 
-        # если автодоставки нет или не удалось определить продукт — просто подтверждаем оплату
-        await bot.send_message(chat_id=callback.from_user.id, text=f"Оплата принята, заказ {purchase_id} отмечен как оплаченный. Администратор обработает заказ.")
+        # уведомляем проверяющего о статусе
+        try:
+            if delivered:
+                # если проверяющий не владелец — сообщаем, что доставка выполнена
+                if callback.from_user and callback.from_user.id != owner_id:
+                    await bot.send_message(chat_id=callback.from_user.id, text=f"Оплата подтверждена. Автовыдача доставлена пользователю (ID: {owner_id}) по заказу #{purchase_id}.")
+            else:
+                # если автодовки нет или не удалось доставить — обычное сообщение
+                await bot.send_message(chat_id=callback.from_user.id, text=f"Оплата принята, заказ #{purchase_id} отмечен как оплаченный. Администратор обработает заказ.")
+        except Exception:
+            pass
+
         await callback.answer()
     else:
         await bot.send_message(chat_id=callback.from_user.id, text="Платёж не найден / не оплачен. Попробуйте снова позднее.")
@@ -741,18 +776,18 @@ async def apply_promo_code(message: Message, state: FSMContext):
     if not promo:
         await message.reply("Промокод не найден или неверен.")
         await state.clear()
-        await send_or_edit(message.chat.id, message, text="Добро пожаловать! Выберите действие:", reply_markup=start_menu_keyboard())
+        await send_main_menu(message.chat.id, message)
         return
     pid, pcode, amount, uses_left, active = promo
     if active != 1:
         await message.reply("Этот промокод отключён.")
         await state.clear()
-        await send_or_edit(message.chat.id, message, text="Добро пожаловать! Выберите действие:", reply_markup=start_menu_keyboard())
+        await send_main_menu(message.chat.id, message)
         return
     if uses_left is not None and uses_left <= 0:
         await message.reply("У этого промокода закончилось количество использований.")
         await state.clear()
-        await send_or_edit(message.chat.id, message, text="Добро пожаловать! Выберите действие:", reply_markup=start_menu_keyboard())
+        await send_main_menu(message.chat.id, message)
         return
 
     # применяем: добавляем баланс пользователю
@@ -773,7 +808,7 @@ async def apply_promo_code(message: Message, state: FSMContext):
 
     await message.reply(f"Промокод применён! Вам зачислено {amount} ₽.")
     await state.clear()
-    await send_or_edit(message.chat.id, message, text="Добро пожаловать! Выберите действие:", reply_markup=start_menu_keyboard())
+    await send_main_menu(message.chat.id, message)
 
 # --- NEW: helpers для промокодов (создание таблицы и CRUD)
 def ensure_promos_table():
@@ -982,16 +1017,16 @@ async def check_crypto_invoice_status(invoice_id: str) -> str:
         return "not"
 
 # helper: собрать стартовую клавиатуру (используется в нескольких местах)
-def start_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Каталог 🛒", callback_data="catalog")],
-            [InlineKeyboardButton(text="Пополнение 🏦", callback_data="recharge"),
-             InlineKeyboardButton(text="Помощь ⁉️", callback_data="help")],
-            [InlineKeyboardButton(text="Промокоды 🎟️", callback_data="promo"),
-             InlineKeyboardButton(text="Мой профиль 👤", callback_data="profile")]
-        ]
-    )
+# def start_menu_keyboard() -> InlineKeyboardMarkup:
+#     return InlineKeyboardMarkup(
+#         inline_keyboard=[
+#             [InlineKeyboardButton(text="Каталог 🛒", callback_data="catalog")],
+#             [InlineKeyboardButton(text="Пополнение 🏦", callback_data="recharge"),
+#              InlineKeyboardButton(text="Помощь ⁉️", callback_data="help")],
+#             [InlineKeyboardButton(text="Промокоды 🎟️", callback_data="promo"),
+#              InlineKeyboardButton(text="Мой профиль 👤", callback_data="profile")]
+#         ]
+#     )
 
 # helper: собрать админ-клавиатуру
 def admin_menu_keyboard() -> InlineKeyboardMarkup:
@@ -1000,17 +1035,43 @@ def admin_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="Управление категориями", callback_data="manage_categories"),
              InlineKeyboardButton(text="Управление товарами", callback_data="manage_products")],
             [InlineKeyboardButton(text="Промокоды 🎟️", callback_data="manage_promos")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")]
+            [InlineKeyboardButton(text="Каталог 🛒", callback_data="catalog")]
         ]
     )
 
 # helper: отправить/редактировать главное меню
 async def send_main_menu(chat_id: int, source_obj):
-    await send_or_edit(chat_id, source_obj, text="Добро пожаловать! Выберите действие:", reply_markup=start_menu_keyboard())
+	"""
+	Формирует главное меню (включая кнопку админ-панели для админов, если requester в ADMIN_IDS)
+	и отправляет через send_or_edit. source_obj может быть Message или CallbackQuery.
+	"""
+	# постараемся получить id пользователя, от чьего имени показываем меню
+	uid = None
+	try:
+		if isinstance(source_obj, CallbackQuery) and source_obj.from_user:
+			uid = source_obj.from_user.id
+		elif isinstance(source_obj, Message) and source_obj.from_user:
+			uid = source_obj.from_user.id
+	except Exception:
+		uid = None
 
-# helper: отправить/редактировать админ-панель
-async def send_admin_menu(chat_id: int, source_obj):
-    await send_or_edit(chat_id, source_obj, text="Админ-панель:", reply_markup=admin_menu_keyboard())
+	keyboard_rows = [
+		[InlineKeyboardButton(text="Каталог 🛒", callback_data="catalog")],
+		[InlineKeyboardButton(text="Пополнение 🏦", callback_data="recharge"),
+		 InlineKeyboardButton(text="Помощь ⁉️", callback_data="help")],
+		[InlineKeyboardButton(text="Промокоды 🎟️", callback_data="promo"),
+		 InlineKeyboardButton(text="Мой профиль 👤", callback_data="profile")]
+	]
+
+	# показать кнопку админ-панели только админам
+	try:
+		if uid in ADMIN_IDS:
+			keyboard_rows.insert(0, [InlineKeyboardButton(text="Админ-панель ⚙️", callback_data="admin_panel")])
+	except Exception:
+		pass
+
+	keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+	await send_or_edit(chat_id, source_obj, text="Добро пожаловать! Выберите действие:", reply_markup=keyboard)
 
 # Команда для открытия админ-панели (текстовая)
 @dp.message(Command("admin"))
@@ -1051,7 +1112,7 @@ async def back_to_start_callback(callback: CallbackQuery):
             await send_main_menu(callback.message.chat.id, callback)
     except Exception:
         # в случае ошибки — отправим простое текстовое главное меню
-        await send_or_edit(callback.message.chat.id, callback, text="Добро пожаловать! Выберите действие:", reply_markup=start_menu_keyboard())
+        await send_main_menu(callback.message.chat.id, callback)
     await callback.answer()
 
 # Добавлен обработчик отмены заказа: удаляет purchase и связанные payments,
