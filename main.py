@@ -1,7 +1,7 @@
 import os
 import asyncio
 import sqlite3
-import traceback  # Добавляем импорт sqlite3
+import traceback 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -451,7 +451,7 @@ async def show_product(callback: CallbackQuery, products, index, category_id):
             ],
             [
                 # <-- changed: use a specific "back_to_main" callback so we always return to main menu from product
-                InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")
+                InlineKeyboardButton(text="◀️ Назад", callback_data="start_command")
             ]
         ]
     )
@@ -1073,6 +1073,13 @@ async def send_main_menu(chat_id: int, source_obj):
 	keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
 	await send_or_edit(chat_id, source_obj, text="Добро пожаловать! Выберите действие:", reply_markup=keyboard)
 
+# <-- ADD: helper to send admin panel (fix NameError)
+async def send_admin_menu(chat_id: int, source_obj):
+	"""
+	Отправляет/редактирует админ-панель (использует admin_menu_keyboard).
+	"""
+	await send_or_edit(chat_id, source_obj, text="Админ-панель:", reply_markup=admin_menu_keyboard())
+
 # Команда для открытия админ-панели (текстовая)
 @dp.message(Command("admin"))
 async def admin_command(message: Message):
@@ -1091,28 +1098,29 @@ async def admin_panel_callback(callback: CallbackQuery):
 # Callback: всегда возвращает в главное меню (используется на карточке товара)
 @dp.callback_query(F.data == "back_to_main")
 async def back_to_main_callback(callback: CallbackQuery):
-	try:
-		await send_main_menu(callback.message.chat.id, callback)
-		await callback.answer()
-	except Exception:
-		# fallback: если не получилось отредактировать — отправить новое сообщение
-		try:
-			await callback.message.reply("Возвращаю в главное меню.")
-		except Exception:
-			pass
-		await callback.answer()
+    try:
+        await send_main_menu(callback.message.chat.id, callback)
+        await callback.answer()
+    except Exception:
+        # fallback: если не получилось отредактировать — отправить новое сообщение
+        try:
+            await callback.message.reply("Возвращаю в главное меню.")
+        except Exception:
+            pass
+        await callback.answer()
 
-# Обработчик кнопки "Назад" — возвращает в админ-панель для админов или в главное меню для всех остальных
+# Обработчик кнопки "Назад" — всегда возвращает в главное меню (не в админ-панель)
 @dp.callback_query(F.data == "back_to_start")
 async def back_to_start_callback(callback: CallbackQuery):
     try:
-        if callback.from_user and callback.from_user.id in ADMIN_IDS:
-            await send_admin_menu(callback.message.chat.id, callback)
-        else:
-            await send_main_menu(callback.message.chat.id, callback)
+        # всегда показываем главное меню, независимо от того, админ или нет
+        await send_main_menu(callback.message.chat.id, callback)
     except Exception:
         # в случае ошибки — отправим простое текстовое главное меню
-        await send_main_menu(callback.message.chat.id, callback)
+        try:
+            await send_or_edit(callback.message.chat.id, callback, text="Добро пожаловать! Выберите действие:")
+        except Exception:
+            pass
     await callback.answer()
 
 # Добавлен обработчик отмены заказа: удаляет purchase и связанные payments,
@@ -1224,14 +1232,56 @@ def get_autodelivery_for_product(product_id: int):
     conn.close()
     return row
 
+# Callback: when product "back" button (callback_data="start_command") pressed -> behave like /start
+@dp.callback_query(F.data == "start_command")
+async def start_command_callback(callback: CallbackQuery):
+    try:
+        if callback.from_user and callback.from_user.id:
+            add_user(callback.from_user.id)
+    except Exception:
+        pass
+    await send_main_menu(callback.message.chat.id, callback)
+    await callback.answer()
+
 # Запуск бота
 async def main():
     init_db()
     ensure_promos_table()
     ensure_autodeliveries_table()
     ensure_payments_table()   # --- NEW: таблица платежей
-    logging.info("Bot work../")
-    await dp.start_polling(bot)
+    logging.info("Bot work...")
+    try:
+        await dp.start_polling(bot)
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        logging.info("Polling cancelled / interrupted.")
+    except Exception:
+        logging.exception("Unexpected error while polling:")
+    finally:
+        # try to shutdown dispatcher (aiogram v3)
+        try:
+            if hasattr(dp, "shutdown"):
+                await dp.shutdown()
+        except Exception:
+            logging.exception("Error during dispatcher shutdown:")
+
+        # close storage if available
+        try:
+            storage = getattr(dp, "storage", None)
+            if storage is not None:
+                if hasattr(storage, "close"):
+                    await storage.close()
+                if hasattr(storage, "wait_closed"):
+                    await storage.wait_closed()
+        except Exception:
+            logging.exception("Error while closing storage:")
+
+        # close bot session
+        try:
+            sess = getattr(bot, "session", None)
+            if sess is not None and hasattr(sess, "close"):
+                await sess.close()
+        except Exception:
+            logging.exception("Error while closing bot session:")
 
 if __name__ == "__main__":
     asyncio.run(main())
