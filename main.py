@@ -691,7 +691,7 @@ async def main():
     finally:
         try:
             if hasattr(dp, "shutdown"):
-                await dp.shutdown()
+                dp.shutdown()
         except Exception:
             logging.exception("Error during dispatcher shutdown:")
 
