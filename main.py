@@ -1,6 +1,7 @@
 import os
 import asyncio
-import sqlite3  # Добавляем импорт sqlite3
+import sqlite3
+import traceback  # Добавляем импорт sqlite3
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -13,29 +14,6 @@ from datetime import datetime
 import functools
 import aiohttp
 from typing import Optional, Any, List
-# попытка импортировать реальную библиотеку; если её нет — создаём заглушку
-try:
-    from AsyncPayments.cryptoBot import AsyncCryptoBot  # type: ignore
-    CRYPTO_AVAILABLE = True
-except Exception:
-    CRYPTO_AVAILABLE = False
-
-    class AsyncCryptoBot:
-        """
-        Заглушка для AsyncCryptoBot, используется если библиотека не установлена.
-        Методы возвращают значения, обозначающие, что платёжная система не настроена.
-        """
-        def __init__(self, token: str, is_testnet: bool = True):
-            self.token = token
-            self.is_testnet = is_testnet
-
-        async def create_invoice(self, *args, **kwargs):
-            # Возвращаем "пустой" объект/словарь — create_cryptopay_invoice вернёт None
-            return {"invoice_id": None, "pay_url": None}
-
-        async def get_invoices(self, *args, **kwargs):
-            # Возвращаем пустой список — check_crypto_invoice вернёт "not"
-            return []
 
 from db_helpers import (
     init_db, add_user, get_categories, add_category, add_product,
@@ -43,17 +21,34 @@ from db_helpers import (
     create_purchase, get_user_profile, get_purchase_history, DB_PATH  # Импортируем DB_PATH
 )
 
+# Добавляем импорт клиента оплат (используем реальную библиотеку, если она доступна)
+try:
+    from AsyncPayments.cryptoBot import AsyncCryptoBot  # type: ignore
+    CRYPTO_AVAILABLE = True
+except Exception:
+    print(traceback.format_exc())
+    CRYPTO_AVAILABLE = False
+    class AsyncCryptoBot:
+        def __init__(self, token: str, is_testnet: bool = True):
+            self.token = token
+            self.is_testnet = is_testnet
+        async def create_invoice(self, *args, **kwargs):
+            return {"invoice_id": None, "pay_url": None}
+        async def get_invoices(self, *args, **kwargs):
+            return []
+
 # Загрузка переменных окружения
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")  # Ожидается строка вида "12345678,23456789"
-CRYPTOPAY_TOKEN = os.getenv("CRYPTOPAY_TOKEN", "")
-CRYPTOPAY_API_URL = os.getenv("CRYPTOPAY_API_URL", "")  # полный endpoint для создания инвойса
-CRYPTOPAY_DEFAULT_CURRENCY = os.getenv("CRYPTOPAY_CURRENCY", "RUB")
 try:
     ADMIN_IDS = {int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip()}
 except Exception:
     ADMIN_IDS = set()
+
+# добавляем переменные для крипто-платежей
+CRYPTOPAY_TOKEN = os.getenv("CRYPTOPAY_TOKEN", "")
+USDT2RUB_RATE = float(os.getenv("USDT2RUB_RATE", "80"))
 
 def _extract_user_from_args(args, kwargs):
     # Найти Message или CallbackQuery среди аргументов/ключевых аргументов
@@ -453,447 +448,144 @@ async def product_navigation_callback(callback: CallbackQuery):
 
     await show_product(callback, products, index, category_id)
 
-# Заменяем/обновляем обработчик покупки: сразу создаём инвойс через CryptoPay (или выполняем автодоставку)
+# Заменён обработчик покупки: теперь отправляем новое сообщение с реквизитами (не редактируемое)
 @dp.callback_query(F.data.startswith("buy_"))
 async def handle_buy_callback(callback: CallbackQuery):
-	try:
-		product_id = int(callback.data.split("_", 1)[1])
-	except ValueError:
-		await callback.answer("Неверный ID товара.", show_alert=True)
-		return
-
-	product = get_product_by_id(product_id)
-	if not product:
-		await send_or_edit(callback.message.chat.id, callback, text="Товар не найден.")
-		await callback.answer()
-		await send_main_menu(callback.message.chat.id, callback)
-		return
-
-	_, name, _, price = product
-
-	# создаём запись заказа
-	purchase_id = create_purchase(callback.from_user.id, product_id)
-
-	# если включена автодоставка — выполняем её сразу
-	autodel = get_autodelivery_for_product(product_id)
-	if autodel and autodel[1] == 1:
-		_, _, content_text, file_path = autodel
-		try:
-			if content_text:
-				await bot.send_message(chat_id=callback.from_user.id, text=f"Автовыдача по заказу {purchase_id} — {name}:\n\n{content_text}")
-			elif file_path:
-				ext = os.path.splitext(file_path)[1].lower()
-				if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
-					await bot.send_photo(chat_id=callback.from_user.id, photo=FSInputFile(file_path), caption=f"Автовыдача по заказу {purchase_id} — {name}")
-				else:
-					await bot.send_document(chat_id=callback.from_user.id, document=FSInputFile(file_path), caption=f"Автовыдача по заказу {purchase_id} — {name}")
-			await callback.message.reply(f"Заказ создан (ID: {purchase_id}). Автовыдача выполнена.")
-		except Exception:
-			await callback.message.reply(f"Заказ создан (ID: {purchase_id}). Возникла ошибка при автодоставке — свяжитесь с поддержкой.")
-		await callback.answer()
-		await send_main_menu(callback.message.chat.id, callback)
-		return
-
-	# иначе — создаём инвойс через CryptoPay и отправляем ссылку
-	pay_link = await create_cryptopay_invoice(amount=price, order_id=purchase_id, description=f"Order {purchase_id}: {name}")
-	if pay_link:
-		await callback.message.reply(f"Заказ создан (ID: {purchase_id}). Для оплаты перейдите по ссылке: {pay_link}")
-	else:
-		await callback.message.reply("Платёжная система не настроена или возникла ошибка при создании инвойса. Свяжитесь с поддержкой.")
-	await callback.answer()
-	await send_main_menu(callback.message.chat.id, callback)
-
-# Обработчик: оплатить крипто (создаём инвойс и даём ссылку)
-@dp.callback_query(F.data.startswith("pay_crypto_"))
-async def pay_crypto_callback(callback: CallbackQuery):
     try:
-        _, purchase_id_str, product_id_str = callback.data.split("_")
-        purchase_id = int(purchase_id_str)
-        product_id = int(product_id_str)
-    except Exception:
-        await callback.answer("Ошибка данных.", show_alert=True)
-        return
-
-    product = get_product_by_id(product_id)
-    if not product:
-        await send_or_edit(callback.message.chat.id, callback, text="Товар не найден.")
-        await callback.answer()
-        return
-
-    _, name, _, price = product
-    pay_link = await create_cryptopay_invoice(amount=price, order_id=purchase_id, description=f"Order {purchase_id}: {name}")
-    if pay_link:
-        # показываем ссылку для оплаты
-        await send_or_edit(callback.message.chat.id, callback, text=f"Перейдите для оплаты: {pay_link}")
-        await callback.answer()
-    else:
-        await send_or_edit(callback.message.chat.id, callback, text="Платёжная система не настроена. Свяжитесь с поддержкой.")
-        await callback.answer()
-
-# Обработчик: оплатить балансом
-@dp.callback_query(F.data.startswith("pay_balance_"))
-async def pay_balance_callback(callback: CallbackQuery):
-    try:
-        _, purchase_id_str, product_id_str = callback.data.split("_")
-        purchase_id = int(purchase_id_str)
-        product_id = int(product_id_str)
-    except Exception:
-        await callback.answer("Ошибка данных.", show_alert=True)
-        return
-
-    profile = get_user_profile(callback.from_user.id)
-    if not profile:
-        await send_or_edit(callback.message.chat.id, callback, text="Профиль не найден. Невозможно оплатить балансом.")
-        await callback.answer()
-        return
-
-    _, balance = profile
-    product = get_product_by_id(product_id)
-    if not product:
-        await send_or_edit(callback.message.chat.id, callback, text="Товар не найден.")
-        await callback.answer()
-        return
-
-    _, name, _, price = product
-    if balance is None:
-        balance = 0
-
-    if balance < price:
-        await send_or_edit(callback.message.chat.id, callback, text=f"Недостаточно средств на балансе ({balance} ₽). Пополните счёт или выберите другой способ оплаты.")
-        await callback.answer()
-        return
-
-    # списываем баланс
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET balance = COALESCE(balance,0) - ? WHERE telegram_id = ?", (price, callback.from_user.id))
-        conn.commit()
-        conn.close()
-    except Exception:
-        await send_or_edit(callback.message.chat.id, callback, text="Ошибка при списании баланса. Свяжитесь с поддержкой.")
-        await callback.answer()
-        return
-
-    # если есть автодоставка — доставляем, иначе подтверждаем оплату
-    autodel = get_autodelivery_for_product(product_id)
-    if autodel and autodel[1] == 1:
-        _, _, content_text, file_path = autodel
-        try:
-            if content_text:
-                await bot.send_message(chat_id=callback.from_user.id, text=f"Оплата принята. Автовыдача по заказу {purchase_id} — {name}:\n\n{content_text}")
-            elif file_path:
-                ext = os.path.splitext(file_path)[1].lower()
-                if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
-                    await bot.send_photo(chat_id=callback.from_user.id, photo=FSInputFile(file_path), caption=f"Оплата принята. Автовыдача по заказу {purchase_id} — {name}")
-                else:
-                    await bot.send_document(chat_id=callback.from_user.id, document=FSInputFile(file_path), caption=f"Оплата принята. Автовыдача по заказу {purchase_id} — {name}")
-            await send_or_edit(callback.message.chat.id, callback, text=f"Оплата принята, заказ {purchase_id} выполнен.")
-        except Exception:
-            await send_or_edit(callback.message.chat.id, callback, text=f"Оплата принята, но возникла ошибка при доставке. Свяжитесь с поддержкой.")
-    else:
-        await send_or_edit(callback.message.chat.id, callback, text=f"Оплата принята, заказ {purchase_id} оформлен. После обработки вы получите товар.")
-    await callback.answer()
-
-# Обработчик: отмена покупки
-@dp.callback_query(F.data.startswith("cancel_buy_"))
-async def cancel_buy_callback(callback: CallbackQuery):
-    try:
-        _, purchase_id_str = callback.data.split("_")
-        purchase_id = int(purchase_id_str)
-    except Exception:
-        await callback.answer("Ошибка данных.", show_alert=True)
-        return
-
-    # Попытка удалить заказ из БД (если таблица существует)
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute("DELETE FROM purchases WHERE id = ?", (purchase_id,))
-        conn.commit()
-        conn.close()
-    except Exception:
-        # если таблицы/структуры нет — игнорируем
-        pass
-
-    await send_or_edit(callback.message.chat.id, callback, text="Покупка отменена.")
-    await callback.answer()
-
-# Callback: показать профиль пользователя
-@dp.callback_query(F.data == "profile")
-async def profile_callback(callback: CallbackQuery):
-    user = get_user_profile(callback.from_user.id)
-    if not user:
-        await send_or_edit(callback.message.chat.id, callback, text="Ваш профиль не найден.")
-        await callback.answer()
-        await send_main_menu(callback.message.chat.id, callback)
-        return
-
-    telegram_id, balance = user
-    text = f"👤 Ваш профиль:\n\n" \
-           f"🔹 Имя: {callback.from_user.full_name}\n" \
-           f"🔹 Счет: {balance} ₽"
-
-    # Клавиатура с кнопками + назад
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Пополнение счета", callback_data="recharge")],
-            [InlineKeyboardButton(text="История покупок", callback_data="purchase_history"),
-             InlineKeyboardButton(text="Настройки", callback_data="settings")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")]
-        ]
-    )
-    await send_or_edit(callback.message.chat.id, callback, text=text, reply_markup=keyboard)
-    await callback.answer()
-    await send_main_menu(callback.message.chat.id, callback)
-
-# Callback: история покупок
-@dp.callback_query(F.data == "purchase_history")
-async def purchase_history_callback(callback: CallbackQuery):
-    purchases = get_purchase_history(callback.from_user.id)
-    if not purchases:
-        # показываем сообщение с кнопкой назад
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")]])
-        await send_or_edit(callback.message.chat.id, callback, text="У вас пока нет покупок.", reply_markup=keyboard)
-        await callback.answer()
-        await send_main_menu(callback.message.chat.id, callback)
-        return
-
-    text = "🛒 Ваша история покупок:\n\n"
-    for purchase_id, product_name, price, created_at in purchases:
-        text += f"🔹 {product_name} — {price} ₽ (ID: {purchase_id}, {created_at})\n"
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")]])
-    await send_or_edit(callback.message.chat.id, callback, text=text, reply_markup=keyboard)
-    await callback.answer()
-    await send_main_menu(callback.message.chat.id, callback)
-
-# Callback: пополнение счета
-@dp.callback_query(F.data == "recharge")
-async def recharge_callback(callback: CallbackQuery):
-    text = "💳 Для пополнения счета перейдите по следующей ссылке:\n\n" \
-           "https://example.com/recharge"
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")]])
-    await send_or_edit(callback.message.chat.id, callback, text=text, reply_markup=keyboard)
-    await callback.answer()
-    await send_main_menu(callback.message.chat.id, callback)
-
-# Callback: настройки
-@dp.callback_query(F.data == "settings")
-async def settings_callback(callback: CallbackQuery):
-    text = "⚙️ Настройки пока недоступны. Следите за обновлениями!"
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")]])
-    await send_or_edit(callback.message.chat.id, callback, text=text, reply_markup=keyboard)
-    await callback.answer()
-    await send_main_menu(callback.message.chat.id, callback)
-
-# /admin — открыть админ-панель
-@dp.message(Command("admin"))
-@admin_only
-async def admin_panel_command(message: Message):
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Управление категориями", callback_data="manage_categories"),
-             InlineKeyboardButton(text="Управление товарами", callback_data="manage_products")],
-            [InlineKeyboardButton(text="Промокоды 🎟️", callback_data="manage_promos")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")]
-        ]
-    )
-    await send_or_edit(message.chat.id, message, text="Админ-панель:", reply_markup=keyboard)
-
-# Callback: управление категориями
-@dp.callback_query(F.data == "manage_categories")
-@admin_only
-async def manage_categories_callback(callback: CallbackQuery):
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Добавить категорию", callback_data="add_category")],
-            [InlineKeyboardButton(text="Удалить категорию", callback_data="delete_category")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")]
-        ]
-    )
-    await send_or_edit(callback.message.chat.id, callback, text="Управление категориями:", reply_markup=keyboard)
-    await callback.answer()
-
-# Callback: добавить категорию
-@dp.callback_query(F.data == "add_category")
-@admin_only
-async def add_category_callback(callback: CallbackQuery, state: FSMContext):
-    await callback.message.reply("Введите название новой категории:")
-    await state.set_state(AdminState.waiting_for_category_name)
-    await callback.answer()
-
-@dp.message(AdminState.waiting_for_category_name)
-@admin_only
-async def process_add_category(message: Message, state: FSMContext):
-    category_name = message.text.strip()
-    add_category(category_name)
-    await message.reply(f"Категория '{category_name}' добавлена.")
-    await state.clear()
-    # вернуться в админ-панель
-    await send_admin_menu(message.chat.id, message)
-
-# Callback: удалить категорию
-@dp.callback_query(F.data == "delete_category")
-@admin_only
-async def delete_category_callback(callback: CallbackQuery):
-    categories = get_categories()
-    if not categories:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")]])
-        await send_or_edit(callback.message.chat.id, callback, text="Нет доступных категорий для удаления.", reply_markup=keyboard)
-        await callback.answer()
-        return
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            *[
-                [InlineKeyboardButton(text=category_name, callback_data=f"delete_category_{category_id}")]
-                for category_id, category_name in categories
-            ],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")]
-        ]
-    )
-    await send_or_edit(callback.message.chat.id, callback, text="Выберите категорию для удаления:", reply_markup=keyboard)
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("delete_category_"))
-@admin_only
-async def process_delete_category(callback: CallbackQuery):
-    try:
-        category_id = int(callback.data.split("_", 1)[1])
-    except ValueError:
-        await callback.answer("Неверный ID категории.", show_alert=True)
-        return
-
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM categories WHERE id = ?", (category_id,))
-    conn.commit()
-    conn.close()
-
-    await send_or_edit(callback.message.chat.id, callback, text="Категория удалена.")
-    await callback.answer()
-    # вернуться в админ-панель
-    await send_admin_menu(callback.message.chat.id, callback)
-
-# Callback: управление товарами
-@dp.callback_query(F.data == "manage_products")
-@admin_only
-async def manage_products_callback(callback: CallbackQuery):
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Добавить товар", callback_data="add_product")],
-            [InlineKeyboardButton(text="Удалить товар", callback_data="delete_product")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")]
-        ]
-    )
-    await send_or_edit(callback.message.chat.id, callback, text="Управление товарами:", reply_markup=keyboard)
-    await callback.answer()
-
-# Callback: добавить товар
-@dp.callback_query(F.data == "add_product")
-@admin_only
-async def add_product_callback(callback: CallbackQuery, state: FSMContext):
-    categories = get_categories()
-    if not categories:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")]])
-        await send_or_edit(callback.message.chat.id, callback, text="Сначала добавьте хотя бы одну категорию.", reply_markup=keyboard)
-        await callback.answer()
-        return
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            *[
-                [InlineKeyboardButton(text=category_name, callback_data=f"select_category_{category_id}")]
-                for category_id, category_name in categories
-            ],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")]
-        ]
-    )
-    await send_or_edit(callback.message.chat.id, callback, text="Выберите категорию для нового товара:", reply_markup=keyboard)
-    await state.set_state(AddProductState.waiting_for_category)
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("select_category_"))
-@admin_only
-async def select_category_for_product(callback: CallbackQuery, state: FSMContext):
-    try:
-        category_id = int(callback.data.split("_")[2])
-    except ValueError:
-        await callback.answer("Неверный ID категории.", show_alert=True)
-        return
-
-    await state.update_data(category_id=category_id)
-    await callback.message.reply("Введите название товара:")
-    await state.set_state(AddProductState.waiting_for_name)
-    await callback.answer()
-
-@dp.message(AddProductState.waiting_for_name)
-async def process_product_name(message: Message, state: FSMContext):
-    await state.update_data(name=message.text.strip())
-    await message.reply("Введите описание товара:")
-    await state.set_state(AddProductState.waiting_for_description)
-
-@dp.message(AddProductState.waiting_for_description)
-async def process_product_description(message: Message, state: FSMContext):
-    await state.update_data(description=message.text.strip())
-    await message.reply("Введите цену товара (в рублях):")
-    await state.set_state(AddProductState.waiting_for_price)
-
-@dp.message(AddProductState.waiting_for_price)
-async def process_product_price(message: Message, state: FSMContext):
-    try:
-        price = int(message.text.strip())
-    except ValueError:
-        await message.reply("Цена должна быть числом. Попробуйте снова.")
-        return
-
-    await state.update_data(price=price)
-    await message.reply("Отправьте фотографию товара:")
-    await state.set_state(AddProductState.waiting_for_photo)
-
-# Callback: удалить товар
-@dp.callback_query(F.data == "delete_product")
-@admin_only
-async def delete_product_callback(callback: CallbackQuery):
-    products = get_products()
-    if not products:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")]])
-        await send_or_edit(callback.message.chat.id, callback, text="Нет доступных товаров для удаления.", reply_markup=keyboard)
-        await callback.answer()
-        return
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            *[
-                [InlineKeyboardButton(text=name, callback_data=f"delete_product_{product_id}")]
-                for product_id, name, _, _ in products
-            ],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")]
-        ]
-    )
-    await send_or_edit(callback.message.chat.id, callback, text="Выберите товар для удаления:", reply_markup=keyboard)
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("delete_product_"))
-@admin_only
-async def process_delete_product(callback: CallbackQuery):
-    try:
-        product_id = int(callback.data.split("_")[2])
+        product_id = int(callback.data.split("_", 1)[1])
     except ValueError:
         await callback.answer("Неверный ID товара.", show_alert=True)
         return
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM products WHERE id = ?", (product_id,))
-    conn.commit()
-    conn.close()
+    product = get_product_by_id(product_id)
+    if not product:
+        await send_or_edit(callback.message.chat.id, callback, text="Товар не найден.")
+        await callback.answer()
+        await send_main_menu(callback.message.chat.id, callback)
+        return
 
-    await callback.message.reply("Товар удален.")
+    _, name, _, price = product
+
+    # создаём запись заказа
+    purchase_id = create_purchase(callback.from_user.id, product_id)
+
+    # # если включена автодоставка — выполняем её сразу
+    # autodel = get_autodelivery_for_product(product_id)
+    # if autodel and autodel[1] == 1:
+    #     _, _, content_text, file_path = autodel
+    #     try:
+    #         if content_text:
+    #             await bot.send_message(chat_id=callback.from_user.id, text=f"Автовыдача по заказу {purchase_id} — {name}:\n\n{content_text}")
+    #         elif file_path:
+    #             ext = os.path.splitext(file_path)[1].lower()
+    #             if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
+    #                 await bot.send_photo(chat_id=callback.from_user.id, photo=FSInputFile(file_path), caption=f"Автовыдача по заказу {purchase_id} — {name}")
+    #             else:
+    #                 await bot.send_document(chat_id=callback.from_user.id, document=FSInputFile(file_path), caption=f"Автовыдача по заказу {purchase_id} — {name}")
+    #         await callback.message.reply(f"Заказ создан (ID: {purchase_id}). Автовыдача выполнена.")
+    #     except Exception:
+    #         await callback.message.reply(f"Заказ создан (ID: {purchase_id}). Возникла ошибка при автодоставке — свяжитесь с поддержкой.")
+    #     await callback.answer()
+    #     await send_main_menu(callback.message.chat.id, callback)
+    #     return
+
+    # иначе — создаём инвойс через CryptoPay
+    invoice = await create_cryptopay_invoice(amount_rub=price, description=f"Order {purchase_id}: {name}")
+    if invoice:
+        invoice_id, pay_url = invoice
+        # сохраняем запись о платеже и получаем payment_id
+        payment_id = create_payment_entry(purchase_id=purchase_id, invoice_id=invoice_id, pay_url=pay_url, method="crypto")
+
+        # формируем текст с реквизитами (новое сообщение)
+        text = (
+            f"💳 Реквизиты для оплаты заказа #{purchase_id}\n\n"
+            f"Товар: {name}\n"
+            f"Сумма: {price} ₽ (~{round(float(price)/max(1.0, float(USDT2RUB_RATE)),6)} USDT)\n"
+            f"Invoice ID: {invoice_id}\n\n"
+            "Нажмите кнопку «Оплатить» чтобы перейти на страницу оплаты. После оплаты нажмите «Проверить оплату»."
+        )
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Оплатить", url=pay_url)],
+            [InlineKeyboardButton(text="Проверить оплату", callback_data=f"checkpay_{payment_id}")],
+            [InlineKeyboardButton(text="Отменить заказ", callback_data=f"cancel_buy_{purchase_id}")]
+        ])
+
+        # отправляем новое сообщение (не edit) чтобы пользователь увидел окно оплаты
+        await bot.send_message(chat_id=callback.from_user.id, text=text, reply_markup=keyboard)
+    else:
+        await bot.send_message(chat_id=callback.from_user.id, text="Не удалось создать платёжную ссылку. Свяжитесь с поддержкой.")
     await callback.answer()
-    # вернуться в админ-панель
-    await send_admin_menu(callback.message.chat.id, callback)
+
+# Callback: проверка статуса платежа (по payment_id)
+@dp.callback_query(F.data.startswith("checkpay_"))
+async def check_payment_callback(callback: CallbackQuery):
+    try:
+        _, payment_id_str = callback.data.split("_", 1)
+        payment_id = int(payment_id_str)
+    except Exception:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+
+    payment = get_payment_by_id(payment_id)
+    if not payment:
+        await callback.answer("Платёж не найден.", show_alert=True)
+        return
+    _, purchase_id, invoice_id, pay_url, method, status = payment
+
+    # проверяем через invoice_id (если есть)
+    if invoice_id:
+        status_remote = await check_crypto_invoice_status(invoice_id)
+    else:
+        status_remote = "not"
+
+    if status_remote == "paid":
+        # обновляем статус по id записи платежа
+        update_payment_status_by_id(payment_id, "paid")
+        mark_purchase_paid(purchase_id)
+
+        # получаем данные покупки для доставки: user_id и product_id
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            cur.execute("SELECT user_id, product_id FROM purchases WHERE id = ?", (purchase_id,))
+            row = cur.fetchone()
+            conn.close()
+        except Exception:
+            row = None
+
+        if row:
+            user_id, product_id = row
+        else:
+            user_id = None
+            product_id = None
+
+        # выполняем автодоставку, если есть
+        if product_id and user_id:
+            autodel = get_autodelivery_for_product(product_id)
+            if autodel and autodel[1] == 1:
+                _, _, content_text, file_path = autodel
+                try:
+                    if content_text:
+                        await bot.send_message(chat_id=user_id, text=f"Оплата принята. Автовыдача по заказу {purchase_id}:\n\n{content_text}")
+                    elif file_path:
+                        ext = os.path.splitext(file_path)[1].lower()
+                        if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
+                            await bot.send_photo(chat_id=user_id, photo=FSInputFile(file_path), caption=f"Оплата принята. Автовыдача по заказу {purchase_id}")
+                        else:
+                            await bot.send_document(chat_id=user_id, document=FSInputFile(file_path), caption=f"Оплата принята. Автовыдача по заказу {purchase_id}")
+                    await bot.send_message(chat_id=callback.from_user.id, text=f"Оплата подтверждена, заказ {purchase_id} выполнен.")
+                except Exception:
+                    await bot.send_message(chat_id=callback.from_user.id, text=f"Оплата подтверждена, но произошла ошибка при доставке. Свяжитесь с поддержкой.")
+                await callback.answer()
+                return
+
+        # если автодоставки нет или не удалось определить продукт — просто подтверждаем оплату
+        await bot.send_message(chat_id=callback.from_user.id, text=f"Оплата принята, заказ {purchase_id} отмечен как оплаченный. Администратор обработает заказ.")
+        await callback.answer()
+    else:
+        await bot.send_message(chat_id=callback.from_user.id, text="Платёж не найден / не оплачен. Попробуйте снова позднее.")
+        await callback.answer()
 
 # --- NEW: управление промокодами (админ)
 @dp.callback_query(F.data == "manage_promos")
@@ -1161,6 +853,126 @@ def update_promo_amount(pid: int, amount: int):
     conn.commit()
     conn.close()
 
+# --- NEW: таблица payments и CRUD
+def ensure_payments_table():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        purchase_id INTEGER,
+        invoice_id TEXT,
+        pay_url TEXT,
+        method TEXT,
+        status TEXT DEFAULT 'pending',
+        created_at TEXT
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+def create_payment_entry(purchase_id: int, invoice_id: Optional[str], pay_url: Optional[str], method: str = "crypto"):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO payments(purchase_id, invoice_id, pay_url, method, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)",
+                   (purchase_id, invoice_id, pay_url, method, datetime.utcnow().isoformat()))
+    pid = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return pid  # возвращаем id записи платежа
+
+def get_payment_by_id(payment_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, purchase_id, invoice_id, pay_url, method, status FROM payments WHERE id = ?", (payment_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+def update_payment_status(invoice_id: str, status: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE payments SET status = ? WHERE invoice_id = ?", (status, invoice_id))
+    conn.commit()
+    conn.close()
+
+# --- NEW helper: обновление статуса платежа по payment_id (используем в callback-проверке)
+def update_payment_status_by_id(payment_id: int, status: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE payments SET status = ? WHERE id = ?", (status, payment_id))
+    conn.commit()
+    conn.close()
+
+# --- NEW: helper для пометки покупки как оплаченной
+def mark_purchase_paid(purchase_id: int):
+    """
+    Помечает покупку как оплаченную в таблице purchases (если поле status существует).
+    Функция безопасно игнорирует ошибки, если структура БД другая.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("UPDATE purchases SET status = 'paid' WHERE id = ?", (purchase_id,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        # игнорируем — таблица/поле может отсутствовать или быть другой структуры
+        pass
+
+# --- NEW: Crypto client и функции для создания/проверки инвойсов
+crypto_client: Optional[Any] = None
+
+def _get_crypto_client():
+    global crypto_client
+    print(CRYPTOPAY_TOKEN, CRYPTO_AVAILABLE)
+    if crypto_client is None and CRYPTOPAY_TOKEN and CRYPTO_AVAILABLE:
+        try:
+            is_testnet = os.getenv("CRYPTOPAY_TESTNET", "1") not in ("0", "false", "False")
+            crypto_client = AsyncCryptoBot(CRYPTOPAY_TOKEN, is_testnet=is_testnet)
+        except Exception:
+            print(traceback.format_exc())
+            crypto_client = None
+    return crypto_client
+
+async def create_cryptopay_invoice(amount_rub: float, description: str = "") -> Optional[tuple]:
+    """
+    Создаёт инвойс через AsyncCryptoBot и возвращает (invoice_id, pay_url) или None.
+    amount_rub — сумма в рублях, конвертируется в USDT по USDT2RUB_RATE.
+    """
+    client = _get_crypto_client()
+    if not client:
+        print("CryptoPay client not available.")
+        return None
+    try:
+        rate = float(USDT2RUB_RATE) if USDT2RUB_RATE else 80.0
+        amount_usdt = max(0.000001, round(float(amount_rub) / rate, 6))
+        invoice = await client.create_invoice(amount=amount_usdt, currency_type="crypto", asset="USDT", description=description)
+        # invoice может быть объектом или dict
+        invoice_id = getattr(invoice, "invoice_id", None) or (invoice.get("invoice_id") if isinstance(invoice, dict) else None)
+        pay_url = getattr(invoice, "pay_url", None) or (invoice.get("pay_url") if isinstance(invoice, dict) else None)
+        return (invoice_id, pay_url)
+    except Exception:
+        print(traceback.format_exc())
+        return None
+
+async def check_crypto_invoice_status(invoice_id: str) -> str:
+    """
+    Проверяет статус инвойса по invoice_id. Возвращает 'paid' или 'not'.
+    """
+    client = _get_crypto_client()
+    if not client or not invoice_id:
+        return "not"
+    try:
+        info = await client.get_invoices(invoice_ids=[invoice_id], count=1)
+        if isinstance(info, list) and len(info) > 0:
+            item = info[0]
+            status = getattr(item, "status", None) or (item.get("status") if isinstance(item, dict) else None)
+            return "paid" if status == "paid" else "not"
+        return "not"
+    except Exception:
+        return "not"
+
 # helper: собрать стартовую клавиатуру (используется в нескольких местах)
 def start_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -1239,65 +1051,12 @@ def get_autodelivery_for_product(product_id: int):
     conn.close()
     return row
 
-# Инициализация клиента AsyncCryptoBot (лениво — при первом вызове)
-crypto_client: Optional[Any] = None
-
-def _get_crypto_client():
-    global crypto_client
-    if crypto_client is None and CRYPTOPAY_TOKEN:
-        try:
-            is_testnet = os.getenv("CRYPTOPAY_TESTNET", "1") not in ("0", "false", "False")
-            crypto_client = AsyncCryptoBot(CRYPTOPAY_TOKEN, is_testnet=is_testnet)
-        except Exception:
-            crypto_client = None
-    return crypto_client
-
-async def create_cryptopay_invoice(amount: float, order_id: Any = None, description: str = "") -> Optional[str]:
-    """
-    Создаёт инвойс через AsyncCryptoBot и возвращает ссылку для оплаты (pay_url) или None.
-    amount — в рублях (скрипт конвертирует в USDT по USDT2RUB_RATE env).
-    """
-    client = _get_crypto_client()
-    if not client:
-        return None
-
-    try:
-        # конвертация RUB -> USDT (настраивается через USDT2RUB_RATE, по умолчанию 80)
-        rate = float(os.getenv("USDT2RUB_RATE", "80"))
-        amount_usdt = max(0.000001, round(float(amount) / rate, 6))
-        # ожидаем, что create_invoice возвращает объект с invoice_id и pay_url (как в примере)
-        invoice = await client.create_invoice(amount=amount_usdt, currency_type="crypto", asset="USDT", description=description)
-        # invoice может быть объектом или dict
-        pay_url = getattr(invoice, "pay_url", None) or invoice.get("pay_url") if isinstance(invoice, dict) else None
-        invoice_id = getattr(invoice, "invoice_id", None) or invoice.get("invoice_id") if isinstance(invoice, dict) else None
-        # опционально: вы можете сохранить invoice_id в БД, связав с purchase_id (если нужно)
-        return pay_url or (invoice_id if invoice_id else None)
-    except Exception:
-        return None
-
-async def check_crypto_invoice(check_id: str) -> str:
-    """
-    Проверяет статус инвойса по его id. Возвращает "paid" или "not".
-    """
-    client = _get_crypto_client()
-    if not client:
-        return "not"
-    try:
-        info = await client.get_invoices(invoice_ids=[check_id], count=1)
-        # ожидаем List-like, где элемент имеет поле status
-        if isinstance(info, List) or isinstance(info, list):
-            item = info[0]
-            status = getattr(item, "status", None) or item.get("status") if isinstance(item, dict) else None
-            return "paid" if status == "paid" else "not"
-        return "not"
-    except Exception:
-        return "not"
-
 # Запуск бота
 async def main():
     init_db()
-    ensure_promos_table()   # --- NEW: создаём таблицу промокодов при старте
-    ensure_autodeliveries_table()  # --- NEW: создаём таблицу автодоставки при старте
+    ensure_promos_table()
+    ensure_autodeliveries_table()
+    ensure_payments_table()   # --- NEW: таблица платежей
     logging.info("Bot work../")
     await dp.start_polling(bot)
 
