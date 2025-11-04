@@ -136,15 +136,23 @@ async def start_command(message: Message):
     add_user(message.from_user.id)
 
     # Создаем inline-клавиатуру с кнопками
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Каталог 🛒", callback_data="catalog")],
-            [InlineKeyboardButton(text="Пополнение 🏦", callback_data="recharge"),
-             InlineKeyboardButton(text="Помощь ⁉️", callback_data="help")],
-            [InlineKeyboardButton(text="Промокоды 🎟️", callback_data="promo"),
-             InlineKeyboardButton(text="Мой профиль 👤", callback_data="profile")]
-        ]
-    )
+    keyboard_rows = [
+        [InlineKeyboardButton(text="Каталог 🛒", callback_data="catalog")],
+        [InlineKeyboardButton(text="Пополнение 🏦", callback_data="recharge"),
+         InlineKeyboardButton(text="Помощь ⁉️", callback_data="help")],
+        [InlineKeyboardButton(text="Промокоды 🎟️", callback_data="promo"),
+         InlineKeyboardButton(text="Мой профиль 👤", callback_data="profile")]
+    ]
+
+    # показать кнопку админ-панели только админам
+    try:
+        uid = message.from_user.id if message.from_user else None
+        if uid in ADMIN_IDS:
+            keyboard_rows.insert(0, [InlineKeyboardButton(text="Админ-панель ⚙️", callback_data="admin_panel")])
+    except Exception:
+        pass
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
 
     await message.reply("Добро пожаловать! Выберите действие:", reply_markup=keyboard)
 
@@ -422,7 +430,8 @@ async def show_product(callback: CallbackQuery, products, index, category_id):
                 InlineKeyboardButton(text="🛒 Купить", callback_data=f"buy_{product_id}")
             ],
             [
-                InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")
+                # <-- changed: use a specific "back_to_main" callback so we always return to main menu from product
+                InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")
             ]
         ]
     )
@@ -532,7 +541,6 @@ async def check_payment_callback(callback: CallbackQuery):
         await callback.answer("Платёж не найден.", show_alert=True)
         return
     _, purchase_id, invoice_id, pay_url, method, status = payment
-
     # проверяем через invoice_id (если есть)
     if invoice_id:
         status_remote = await check_crypto_invoice_status(invoice_id)
@@ -1004,6 +1012,35 @@ async def send_main_menu(chat_id: int, source_obj):
 async def send_admin_menu(chat_id: int, source_obj):
     await send_or_edit(chat_id, source_obj, text="Админ-панель:", reply_markup=admin_menu_keyboard())
 
+# Команда для открытия админ-панели (текстовая)
+@dp.message(Command("admin"))
+async def admin_command(message: Message):
+	if message.from_user and message.from_user.id in ADMIN_IDS:
+		await send_admin_menu(message.chat.id, message)
+	else:
+		await message.reply("Доступ запрещён. Эта команда доступна только администраторам.")
+
+# Callback: открыть админ-панель по кнопке (только для админов)
+@dp.callback_query(F.data == "admin_panel")
+@admin_only
+async def admin_panel_callback(callback: CallbackQuery):
+	await send_admin_menu(callback.message.chat.id, callback)
+	await callback.answer()
+
+# Callback: всегда возвращает в главное меню (используется на карточке товара)
+@dp.callback_query(F.data == "back_to_main")
+async def back_to_main_callback(callback: CallbackQuery):
+	try:
+		await send_main_menu(callback.message.chat.id, callback)
+		await callback.answer()
+	except Exception:
+		# fallback: если не получилось отредактировать — отправить новое сообщение
+		try:
+			await callback.message.reply("Возвращаю в главное меню.")
+		except Exception:
+			pass
+		await callback.answer()
+
 # Обработчик кнопки "Назад" — возвращает в админ-панель для админов или в главное меню для всех остальных
 @dp.callback_query(F.data == "back_to_start")
 async def back_to_start_callback(callback: CallbackQuery):
@@ -1016,6 +1053,81 @@ async def back_to_start_callback(callback: CallbackQuery):
         # в случае ошибки — отправим простое текстовое главное меню
         await send_or_edit(callback.message.chat.id, callback, text="Добро пожаловать! Выберите действие:", reply_markup=start_menu_keyboard())
     await callback.answer()
+
+# Добавлен обработчик отмены заказа: удаляет purchase и связанные payments,
+# затем возвращает пользователя в выбор товара (если можно) или в главное меню.
+@dp.callback_query(F.data.startswith("cancel_buy_"))
+async def cancel_buy_callback(callback: CallbackQuery):
+    try:
+        # безопасно извлекаем id заказа
+        purchase_id = int(callback.data.split("_", 1)[1])
+    except Exception:
+        await send_main_menu(callback.message.chat.id, callback)
+        return
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, product_id FROM purchases WHERE id = ?", (purchase_id,))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            await callback.answer("Покупка не найдена.", show_alert=True)
+            await send_main_menu(callback.message.chat.id, callback)
+            return
+        owner_id, product_id = row
+
+        requester = getattr(callback.from_user, "id", None)
+        if requester not in ADMIN_IDS and requester != owner_id:
+            conn.close()
+            await callback.answer("Отмена доступна только владельцу заказа или администратору.", show_alert=True)
+            return
+
+        # удаляем связанные платежи и сам заказ
+        cur.execute("DELETE FROM payments WHERE purchase_id = ?", (purchase_id,))
+        cur.execute("DELETE FROM purchases WHERE id = ?", (purchase_id,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        await callback.answer("Ошибка при отмене заказа. Свяжитесь с поддержкой.", show_alert=True)
+        return
+
+    # Теперь пытаемся вернуть пользователя в выбор товара:
+    # если product_id известно — получить category_id и товары категории, показать первый товар
+    if product_id:
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            cur.execute("SELECT category_id FROM products WHERE id = ?", (product_id,))
+            c_row = cur.fetchone()
+            conn.close()
+            if c_row:
+                category_id = c_row[0]
+                products = get_products_by_category(category_id)
+                if products:
+                    # Отправляем карточку первого товара в категории
+                    prod = products[0]
+                    pid, name, description, price, photo_path = prod
+                    text = f"🔹 <b>{name}</b>\n💬 {description}\n💰 Цена: {price} ₽"
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                        [
+                            InlineKeyboardButton(text="⬅️ Предыдущий", callback_data="disabled"),
+                            InlineKeyboardButton(text="➡️ Следующий", callback_data=f"product_{category_id}_1" if len(products) > 1 else "disabled")
+                        ],
+                        [InlineKeyboardButton(text="🛒 Купить", callback_data=f"buy_{pid}")],
+                        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")]
+                    ])
+                    await bot.send_message(chat_id=callback.message.chat.id, text=text, reply_markup=keyboard, parse_mode="HTML")
+                    await callback.answer("Покупка отменена. Возврат к товарам категории.")
+                    return
+        except Exception:
+            # если что-то пошло не так — просто покажем главное меню ниже
+            pass
+
+    # fallback: показать главное меню
+    await send_or_edit(callback.message.chat.id, callback, text=f"Покупка {purchase_id} отменена.")
+    await callback.answer()
+    await send_main_menu(callback.message.chat.id, callback)
 
 # --- NEW: таблица автодоставки и helpers
 def ensure_autodeliveries_table():
