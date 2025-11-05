@@ -13,7 +13,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY,
             telegram_id INTEGER UNIQUE,
-            stars INTEGER DEFAULT 0
+            stars INTEGER DEFAULT 0,
+            balance INTEGER DEFAULT 0
         )
     """)
     cursor.execute("""
@@ -37,6 +38,7 @@ def init_db():
             user_id INTEGER,
             product_id INTEGER,
             payment_status TEXT DEFAULT 'pending',
+            status TEXT,
             created_at DATETIME DEFAULT (datetime('now')),
             FOREIGN KEY(user_id) REFERENCES users(id),
             FOREIGN KEY(product_id) REFERENCES products(id)
@@ -44,15 +46,25 @@ def init_db():
     """)
     conn.commit()
 
-    # Проверяем наличие колонки category_id в таблице products
+    cursor.execute("PRAGMA table_info(users)")
+    user_columns = [column[1] for column in cursor.fetchall()]
+    if "balance" not in user_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN balance INTEGER DEFAULT 0")
+        conn.commit()
+
+    cursor.execute("PRAGMA table_info(purchases)")
+    purchase_columns = [column[1] for column in cursor.fetchall()]
+    if "status" not in purchase_columns:
+        cursor.execute("ALTER TABLE purchases ADD COLUMN status TEXT")
+        conn.commit()
+
     cursor.execute("PRAGMA table_info(products)")
-    columns = [column[1] for column in cursor.fetchall()]
-    if "category_id" not in columns:
+    product_columns = [column[1] for column in cursor.fetchall()]
+    if "category_id" not in product_columns:
         cursor.execute("ALTER TABLE products ADD COLUMN category_id INTEGER REFERENCES categories(id)")
         conn.commit()
 
-    # Проверяем наличие колонки photo_path в таблице products
-    if "photo_path" not in columns:
+    if "photo_path" not in product_columns:
         cursor.execute("ALTER TABLE products ADD COLUMN photo_path TEXT")
         conn.commit()
 

@@ -158,3 +158,17 @@ def get_autodelivery_for_product(product_id: int):
     row = cursor.fetchone()
     conn.close()
     return row
+
+def update_promo_uses_db(pid: int, uses_left):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE promocodes SET uses_left = ? WHERE id = ?", (uses_left if uses_left is not None else None, pid))
+    conn.commit()
+    conn.close()
+
+def deactivate_promo_db(pid: int):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE promocodes SET active = 0 WHERE id = ?", (pid,))
+    conn.commit()
+    conn.close()

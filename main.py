@@ -12,7 +12,7 @@ from config import BOT_TOKEN, ADMIN_IDS, USDT2RUB_RATE
 from decorators import admin_only
 from keyboards import admin_menu_keyboard, main_menu_keyboard
 from utils import send_or_edit
-from states import AddProductState, PromoAdminState, UserPromoState
+from states import AddProductState, PromoAdminState, UserPromoState, PurchaseState, DeleteState
 from database import (
     ensure_promos_table, create_promo_in_db, get_promos_from_db, get_promo_by_id,
     delete_promo_from_db, toggle_promo_active, get_promo_by_code,
@@ -263,7 +263,7 @@ async def product_navigation_callback(callback: CallbackQuery):
     await show_product(callback, products, index, category_id)
 
 @dp.callback_query(F.data.startswith("buy_"))
-async def handle_buy_callback(callback: CallbackQuery):
+async def handle_buy_callback(callback: CallbackQuery, state: FSMContext):
     try:
         product_id = int(callback.data.split("_", 1)[1])
     except ValueError:
@@ -278,19 +278,39 @@ async def handle_buy_callback(callback: CallbackQuery):
         return
 
     _, name, _, price = product
+    await state.update_data(product_id=product_id, product_name=name, original_price=price)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Ввести промокод", callback_data="apply_promo_in_purchase")],
+        [InlineKeyboardButton(text="Оплатить без промокода", callback_data="skip_promo_purchase")]
+    ])
+    text = f"📦 {name}\n💰 Цена: {price} ₽\n\nХотите применить промокод?"
+    await send_or_edit(bot, callback.message.chat.id, callback, text=text, reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data == "apply_promo_in_purchase")
+async def apply_promo_in_purchase(callback: CallbackQuery, state: FSMContext):
+    await callback.message.reply("Введите ваш промокод:")
+    await state.set_state(PurchaseState.waiting_for_promo)
+    await callback.answer()
+
+async def create_payment_with_data(callback: CallbackQuery, product_id: int, product_name: str, final_price: int, state: FSMContext):
+    """
+    Создаёт платёж с финальной ценой (после применения промокода).
+    """
     purchase_id = create_purchase(callback.from_user.id, product_id)
 
-    invoice = await create_cryptopay_invoice(amount_rub=price, description=f"Order {purchase_id}: {name}")
+    invoice = await create_cryptopay_invoice(amount_rub=final_price, description=f"Order {purchase_id}: {product_name}")
     if invoice:
         invoice_id, pay_url = invoice
         payment_id = create_payment_entry(purchase_id=purchase_id, invoice_id=invoice_id, pay_url=pay_url, method="crypto")
 
         text = (
             f"💳 Реквизиты для оплаты заказа #{purchase_id}\n\n"
-            f"Товар: {name}\n"
-            f"Сумма: {price} ₽ (~{round(float(price)/max(1.0, float(USDT2RUB_RATE)),6)} USDT)\n"
+            f"Товар: {product_name}\n"
+            f"Сумма: {final_price} ₽ (~{round(float(final_price)/max(1.0, float(USDT2RUB_RATE)),6)} USDT)\n"
             f"Invoice ID: {invoice_id}\n\n"
-            "Нажмите кнопку «Оплатить» чтобы перейти на страницу оплаты. После оплаты нажмите «Проверить оплату»."
+            "Нажмите кнопку «Оплатить» чтобы перейти на страницу оплаты."
         )
 
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -302,81 +322,94 @@ async def handle_buy_callback(callback: CallbackQuery):
         await bot.send_message(chat_id=callback.from_user.id, text=text, reply_markup=keyboard)
     else:
         await bot.send_message(chat_id=callback.from_user.id, text="Не удалось создать платёжную ссылку. Свяжитесь с поддержкой.")
+    
+    await state.clear()
+
+@dp.message(PurchaseState.waiting_for_promo)
+async def process_promo_in_purchase(message: Message, state: FSMContext):
+    code = message.text.strip().upper()
+    promo = get_promo_by_code(code)
+    
+    data = await state.get_data()
+    product_id = data.get("product_id")
+    product_name = data.get("product_name")
+    original_price = data.get("original_price")
+    
+    if not promo:
+        await message.reply("❌ Промокод не найден или неверен.")
+        await state.clear()
+        await send_main_menu(message.chat.id, message)
+        return
+    
+    pid, pcode, amount, uses_left, active = promo
+    if active != 1:
+        await message.reply("❌ Этот промокод отключён.")
+        await state.clear()
+        await send_main_menu(message.chat.id, message)
+        return
+    
+    if uses_left is not None and uses_left <= 0:
+        await message.reply("❌ У этого промокода закончилось количество использований.")
+        await state.clear()
+        await send_main_menu(message.chat.id, message)
+        return
+    
+    # Вычисляем новую цену
+    final_price = max(1, original_price - amount)
+    await state.update_data(promo_id=pid, promo_amount=amount, final_price=final_price, promo_code=code)
+    
+    # Деакрементируем uses_left
+    if uses_left is not None:
+        new_uses = uses_left - 1
+        from database import update_promo_uses_db
+        update_promo_uses_db(pid, new_uses)
+        if new_uses <= 0:
+            from database import deactivate_promo_db
+            deactivate_promo_db(pid)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_purchase_with_promo")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_purchase")]
+    ])
+    text = f"✅ Промокод применён!\n\n📦 {product_name}\n💰 Исходная цена: {original_price} ₽\n🎟️ Скидка: -{amount} ₽\n💵 Итого: {final_price} ₽"
+    await message.reply(text=text, reply_markup=keyboard)
+
+@dp.callback_query(F.data == "skip_promo_purchase")
+async def skip_promo_purchase(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    product_id = data.get("product_id")
+    product_name = data.get("product_name")
+    original_price = data.get("original_price")
+    
+    if not product_id or not product_name or original_price is None:
+        await send_main_menu(callback.message.chat.id, callback)
+        await callback.answer()
+        return
+    
+    await create_payment_with_data(callback, product_id, product_name, original_price, state)
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("checkpay_"))
-async def check_payment_callback(callback: CallbackQuery):
-    try:
-        _, payment_id_str = callback.data.split("_", 1)
-        payment_id = int(payment_id_str)
-    except Exception:
-        await callback.answer("Ошибка данных.", show_alert=True)
-        return
-
-    payment = get_payment_by_id(payment_id)
-    if not payment:
-        await callback.answer("Платёж не найден.", show_alert=True)
-        return
-    _, purchase_id, invoice_id, pay_url, method, status = payment
-
-    if invoice_id:
-        status_remote = await check_crypto_invoice_status(invoice_id)
-    else:
-        status_remote = "not"
-
-    if status_remote == "paid":
-        update_payment_status_by_id(payment_id, "paid")
-        mark_purchase_paid(purchase_id)
-
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            cur = conn.cursor()
-            cur.execute("SELECT user_id, product_id FROM purchases WHERE id = ?", (purchase_id,))
-            row = cur.fetchone()
-            conn.close()
-        except Exception:
-            row = None
-
-        owner_id = None
-        product_id = None
-        if row:
-            owner_id, product_id = row
-
-        delivered = False
-        if product_id and owner_id:
-            autodel = get_autodelivery_for_product(product_id)
-            if autodel and autodel[1] == 1:
-                try:
-                    _, _, content_text, file_path = autodel
-                    if content_text:
-                        await bot.send_message(chat_id=owner_id, text=f"Оплата принята. Автовыдача по заказу {purchase_id}:\n\n{content_text}")
-                        delivered = True
-                    elif file_path:
-                        ext = os.path.splitext(file_path)[1].lower()
-                        if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
-                            await bot.send_photo(chat_id=owner_id, photo=FSInputFile(file_path), caption=f"Оплата принята. Автовыдача по заказу {purchase_id}")
-                        else:
-                            await bot.send_document(chat_id=owner_id, document=FSInputFile(file_path), caption=f"Оплата принята. Автовыдача по заказу {purchase_id}")
-                        delivered = True
-                except Exception:
-                    try:
-                        await bot.send_message(chat_id=callback.from_user.id, text=f"Оплата принята, но ошибка при автодовке владельцу заказа {purchase_id}. Свяжитесь с поддержкой.")
-                    except Exception:
-                        pass
-
-        try:
-            if delivered:
-                if callback.from_user and callback.from_user.id != owner_id:
-                    await bot.send_message(chat_id=callback.from_user.id, text=f"Оплата подтверждена. Автовыдача доставлена пользователю (ID: {owner_id}) по заказу #{purchase_id}.")
-            else:
-                await bot.send_message(chat_id=callback.from_user.id, text=f"Оплата принята, заказ #{purchase_id} отмечен как оплаченный. Администратор обработает заказ.")
-        except Exception:
-            pass
-
+@dp.callback_query(F.data == "confirm_purchase_with_promo")
+async def confirm_purchase_with_promo(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    product_id = data.get("product_id")
+    product_name = data.get("product_name")
+    final_price = data.get("final_price")
+    
+    if not product_id or not product_name or final_price is None:
+        await send_main_menu(callback.message.chat.id, callback)
+        await state.clear()
         await callback.answer()
-    else:
-        await bot.send_message(chat_id=callback.from_user.id, text="Платёж не найден / не оплачен. Попробуйте снова позднее.")
-        await callback.answer()
+        return
+    
+    await create_payment_with_data(callback, product_id, product_name, final_price, state)
+    await callback.answer()
+
+@dp.callback_query(F.data == "cancel_purchase")
+async def cancel_purchase(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await send_main_menu(callback.message.chat.id, callback)
+    await callback.answer()
 
 @dp.callback_query(F.data == "manage_promos")
 @admin_only
@@ -555,11 +588,340 @@ async def admin_command(message: Message):
     else:
         await message.reply("Доступ запрещён. Эта команда доступна только администраторам.")
 
+@dp.message(Command("delete_category"))
+async def delete_category_command(message: Message, state: FSMContext):
+    if message.from_user and message.from_user.id not in ADMIN_IDS:
+        await message.reply("Доступ запрещён. Команда доступна только администраторам.")
+        return
+    
+    await message.reply("Введите название категории для удаления:")
+    await state.set_state(DeleteState.waiting_for_category_name)
+
+@dp.message(DeleteState.waiting_for_category_name)
+async def process_delete_category_name(message: Message, state: FSMContext):
+    category_name = message.text.strip()
+    
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA foreign_keys = OFF")
+        cur = conn.cursor()
+        
+        # Получаем ID категории по названию
+        cur.execute("SELECT id FROM categories WHERE name = ?", (category_name,))
+        cat_row = cur.fetchone()
+        
+        if not cat_row:
+            await message.reply(f"❌ Категория '{category_name}' не найдена.")
+            await state.clear()
+            return
+        
+        cat_id = cat_row[0]
+        
+        # Получаем все товары в этой категории
+        cur.execute("SELECT id FROM products WHERE category_id = ?", (cat_id,))
+        products = cur.fetchall()
+        
+        # Удаляем платежи и покупки связанные с товарами
+        for (prod_id,) in products:
+            cur.execute("DELETE FROM autodeliveries WHERE product_id = ?", (prod_id,))
+            cur.execute("DELETE FROM payments WHERE purchase_id IN (SELECT id FROM purchases WHERE product_id = ?)", (prod_id,))
+            cur.execute("DELETE FROM purchases WHERE product_id = ?", (prod_id,))
+        
+        # Удаляем товары
+        cur.execute("DELETE FROM products WHERE category_id = ?", (cat_id,))
+        
+        # Удаляем категорию
+        cur.execute("DELETE FROM categories WHERE id = ?", (cat_id,))
+        
+        conn.commit()
+        conn.close()
+        
+        await message.reply(f"✅ Категория '{category_name}' удалена вместе с {len(products)} товарами.")
+        await state.clear()
+    except Exception as e:
+        logging.error(f"Error deleting category by name: {e}")
+        await message.reply(f"❌ Ошибка при удалении категории: {str(e)}")
+        await state.clear()
+
+@dp.message(Command("delete_product"))
+async def delete_product_command(message: Message, state: FSMContext):
+    if message.from_user and message.from_user.id not in ADMIN_IDS:
+        await message.reply("Доступ запрещён. Команда доступна только администраторам.")
+        return
+    
+    await message.reply("Введите название товара для удаления:")
+    await state.set_state(DeleteState.waiting_for_product_name)
+
+@dp.message(DeleteState.waiting_for_product_name)
+async def process_delete_product_name(message: Message, state: FSMContext):
+    product_name = message.text.strip()
+    
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA foreign_keys = OFF")
+        cur = conn.cursor()
+        
+        # Получаем ID товара по названию
+        cur.execute("SELECT id FROM products WHERE name = ?", (product_name,))
+        prod_row = cur.fetchone()
+        
+        if not prod_row:
+            await message.reply(f"❌ Товар '{product_name}' не найден.")
+            await state.clear()
+            return
+        
+        prod_id = prod_row[0]
+        
+        # Удаляем автодоставку
+        cur.execute("DELETE FROM autodeliveries WHERE product_id = ?", (prod_id,))
+        
+        # Удаляем связанные платежи и покупки
+        cur.execute("DELETE FROM payments WHERE purchase_id IN (SELECT id FROM purchases WHERE product_id = ?)", (prod_id,))
+        cur.execute("DELETE FROM purchases WHERE product_id = ?", (prod_id,))
+        
+        # Удаляем сам товар
+        cur.execute("DELETE FROM products WHERE id = ?", (prod_id,))
+        
+        conn.commit()
+        conn.close()
+        
+        await message.reply(f"✅ Товар '{product_name}' удалён.")
+        await state.clear()
+    except Exception as e:
+        logging.error(f"Error deleting product by name: {e}")
+        await message.reply(f"❌ Ошибка при удалении товара: {str(e)}")
+        await state.clear()
+
 @dp.callback_query(F.data == "admin_panel")
 @admin_only
 async def admin_panel_callback(callback: CallbackQuery):
     await send_admin_menu(callback.message.chat.id, callback)
     await callback.answer()
+
+@dp.callback_query(F.data == "manage_categories")
+@admin_only
+async def manage_categories_callback(callback: CallbackQuery):
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Добавить категорию", callback_data="add_category")],
+            [InlineKeyboardButton(text="Список категорий", callback_data="list_categories")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_panel")]
+        ]
+    )
+    await send_or_edit(bot, callback.message.chat.id, callback, text="Управление категориями:", reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data == "add_category")
+@admin_only
+async def add_category_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.message.reply("Введите название новой категории:")
+    await state.set_state(AddProductState.waiting_for_category)
+    await callback.answer()
+
+@dp.callback_query(F.data == "list_categories")
+@admin_only
+async def list_categories_callback(callback: CallbackQuery):
+    categories = get_categories()
+    if not categories:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="manage_categories")]])
+        await send_or_edit(bot, callback.message.chat.id, callback, text="Категорий не найдено.", reply_markup=keyboard)
+        await callback.answer()
+        return
+    
+    inline = []
+    for cat_id, cat_name in categories:
+        inline.append([InlineKeyboardButton(text=f"📁 {cat_name}", callback_data=f"category_info_{cat_id}")])
+    inline.append([InlineKeyboardButton(text="◀️ Назад", callback_data="manage_categories")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=inline)
+    await send_or_edit(bot, callback.message.chat.id, callback, text="Список категорий:", reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("category_info_"))
+@admin_only
+async def category_info_callback(callback: CallbackQuery):
+    try:
+        cat_id = int(callback.data.split("_")[2])
+    except ValueError:
+        await callback.answer("Ошибка.", show_alert=True)
+        return
+    
+    categories = get_categories()
+    cat_name = next((c[1] for c in categories if c[0] == cat_id), None)
+    if not cat_name:
+        await callback.answer("Категория не найдена.", show_alert=True)
+        return
+    
+    products = get_products_by_category(cat_id)
+    text = f"📁 Категория: {cat_name}\n📦 Товаров: {len(products)}"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Удалить категорию", callback_data=f"delete_category_{cat_id}")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="list_categories")]
+    ])
+    await send_or_edit(bot, callback.message.chat.id, callback, text=text, reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("delete_category_"))
+@admin_only
+async def delete_category_callback(callback: CallbackQuery):
+    try:
+        cat_id = int(callback.data.split("_")[2])
+    except ValueError:
+        await callback.answer("Ошибка.", show_alert=True)
+        return
+    
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA foreign_keys = OFF")
+        cur = conn.cursor()
+        
+        # Получаем все товары в этой категории
+        cur.execute("SELECT id FROM products WHERE category_id = ?", (cat_id,))
+        products = cur.fetchall()
+        
+        # Удаляем платежи и покупки связанные с товарами в категории
+        for (prod_id,) in products:
+            cur.execute("DELETE FROM autodeliveries WHERE product_id = ?", (prod_id,))
+            cur.execute("DELETE FROM payments WHERE purchase_id IN (SELECT id FROM purchases WHERE product_id = ?)", (prod_id,))
+            cur.execute("DELETE FROM purchases WHERE product_id = ?", (prod_id,))
+        
+        # Удаляем товары
+        cur.execute("DELETE FROM products WHERE category_id = ?", (cat_id,))
+        
+        # Удаляем категорию
+        cur.execute("DELETE FROM categories WHERE id = ?", (cat_id,))
+        
+        conn.commit()
+        conn.close()
+        
+        await callback.answer("Категория удалена.")
+        await send_or_edit(bot, callback.message.chat.id, callback, text="Категория удалена.")
+        await asyncio.sleep(1)
+        await list_categories_callback(callback)
+    except Exception as e:
+        logging.error(f"Error deleting category: {e}")
+        await callback.answer(f"Ошибка при удалении категории: {str(e)}", show_alert=True)
+
+@dp.callback_query(F.data == "manage_products")
+@admin_only
+async def manage_products_callback(callback: CallbackQuery):
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Добавить товар", callback_data="add_product_btn")],
+            [InlineKeyboardButton(text="Список товаров", callback_data="list_products")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_panel")]
+        ]
+    )
+    await send_or_edit(bot, callback.message.chat.id, callback, text="Управление товарами:", reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data == "add_product_btn")
+@admin_only
+async def add_product_btn_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.message.reply("Используйте команду /add_product для добавления товара.")
+    await callback.answer()
+
+@dp.callback_query(F.data == "list_products")
+@admin_only
+async def list_products_callback(callback: CallbackQuery):
+    categories = get_categories()
+    if not categories:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="manage_products")]])
+        await send_or_edit(bot, callback.message.chat.id, callback, text="Категорий не найдено.", reply_markup=keyboard)
+        await callback.answer()
+        return
+    
+    inline = []
+    for cat_id, cat_name in categories:
+        products = get_products_by_category(cat_id)
+        inline.append([InlineKeyboardButton(text=f"📁 {cat_name} ({len(products)})", callback_data=f"cat_products_{cat_id}")])
+    inline.append([InlineKeyboardButton(text="◀️ Назад", callback_data="manage_products")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=inline)
+    await send_or_edit(bot, callback.message.chat.id, callback, text="Выберите категорию:", reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("cat_products_"))
+@admin_only
+async def cat_products_callback(callback: CallbackQuery):
+    try:
+        cat_id = int(callback.data.split("_")[2])
+    except ValueError:
+        await callback.answer("Ошибка.", show_alert=True)
+        return
+    
+    products = get_products_by_category(cat_id)
+    if not products:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="list_products")]])
+        await send_or_edit(bot, callback.message.chat.id, callback, text="Товаров не найдено.", reply_markup=keyboard)
+        await callback.answer()
+        return
+    
+    inline = []
+    for prod in products:
+        prod_id, name, description, price, photo_path = prod
+        label = f"📦 {name} — {price}₽"
+        inline.append([InlineKeyboardButton(text=label, callback_data=f"product_detail_{prod_id}")])
+    inline.append([InlineKeyboardButton(text="◀️ Назад", callback_data="list_products")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=inline)
+    await send_or_edit(bot, callback.message.chat.id, callback, text="Товары в категории:", reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("product_detail_"))
+@admin_only
+async def product_detail_callback(callback: CallbackQuery):
+    try:
+        prod_id = int(callback.data.split("_")[2])
+    except ValueError:
+        await callback.answer("Ошибка.", show_alert=True)
+        return
+    
+    product = get_product_by_id(prod_id)
+    if not product:
+        await callback.answer("Товар не найден.", show_alert=True)
+        return
+    
+    pid, name, description, price = product
+    text = f"📦 {name}\n\n{description}\n\n💰 Цена: {price}₽"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Удалить товар", callback_data=f"delete_product_{prod_id}")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="list_products")]
+    ])
+    await send_or_edit(bot, callback.message.chat.id, callback, text=text, reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("delete_product_"))
+@admin_only
+async def delete_product_callback(callback: CallbackQuery):
+    try:
+        prod_id = int(callback.data.split("_")[2])
+    except ValueError:
+        await callback.answer("Ошибка.", show_alert=True)
+        return
+    
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA foreign_keys = OFF")
+        cur = conn.cursor()
+        
+        # Удаляем автодоставку если она существует
+        cur.execute("DELETE FROM autodeliveries WHERE product_id = ?", (prod_id,))
+        
+        # Удаляем связанные платежи и покупки
+        cur.execute("DELETE FROM payments WHERE purchase_id IN (SELECT id FROM purchases WHERE product_id = ?)", (prod_id,))
+        cur.execute("DELETE FROM purchases WHERE product_id = ?", (prod_id,))
+        
+        # Удаляем сам товар
+        cur.execute("DELETE FROM products WHERE id = ?", (prod_id,))
+        
+        conn.commit()
+        conn.close()
+        
+        await callback.answer("Товар удалён.")
+        await send_or_edit(bot, callback.message.chat.id, callback, text="Товар удалён.")
+        await asyncio.sleep(1)
+        await list_products_callback(callback)
+    except Exception as e:
+        logging.error(f"Error deleting product: {e}")
+        await callback.answer(f"Ошибка при удалении товара: {str(e)}", show_alert=True)
 
 @dp.callback_query(F.data == "back_to_main")
 async def back_to_main_callback(callback: CallbackQuery):
@@ -676,19 +1038,113 @@ async def send_main_menu(chat_id: int, source_obj):
 async def send_admin_menu(chat_id: int, source_obj):
     await send_or_edit(bot, chat_id, source_obj, text="Админ-панель:", reply_markup=admin_menu_keyboard())
 
+async def process_pending_deliveries():
+    """
+    Фоновая задача: периодически проверяет оплаченные заказы и отправляет автовыдачу.
+    """
+    while True:
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            
+            # Получаем оплаченные, но не доставленные заказы
+            cur.execute("""
+                SELECT p.id, p.user_id, p.product_id 
+                FROM purchases p
+                JOIN payments pm ON p.id = pm.purchase_id
+                WHERE pm.status = 'paid' AND p.status IS NULL
+                LIMIT 10
+            """)
+            orders = cur.fetchall()
+            conn.close()
+            
+            for order_id, user_id, product_id in orders:
+                try:
+                    # Получаем информацию о пользователе
+                    conn = sqlite3.connect(DB_PATH)
+                    cur = conn.cursor()
+                    cur.execute("SELECT telegram_id FROM users WHERE id = ?", (user_id,))
+                    user_row = cur.fetchone()
+                    conn.close()
+                    
+                    if not user_row:
+                        continue
+                    
+                    telegram_id = user_row[0]
+                    
+                    # Получаем информацию об автодоставке
+                    autodel = get_autodelivery_for_product(product_id)
+                    if autodel and autodel[1] == 1:
+                        _, _, content_text, file_path = autodel
+                        try:
+                            if content_text:
+                                await bot.send_message(
+                                    chat_id=telegram_id,
+                                    text=f"✅ Спасибо за покупку! Ваша автовыдача по заказу #{order_id}:\n\n{content_text}"
+                                )
+                            elif file_path and os.path.exists(file_path):
+                                ext = os.path.splitext(file_path)[1].lower()
+                                if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
+                                    await bot.send_photo(
+                                        chat_id=telegram_id,
+                                        photo=FSInputFile(file_path),
+                                        caption=f"✅ Спасибо за покупку! Ваша автовыдача по заказу #{order_id}"
+                                    )
+                                else:
+                                    await bot.send_document(
+                                        chat_id=telegram_id,
+                                        document=FSInputFile(file_path),
+                                        caption=f"✅ Спасибо за покупку! Ваша автовыдача по заказу #{order_id}"
+                                    )
+                            
+                            # Отмечаем заказ как доставленный
+                            conn = sqlite3.connect(DB_PATH)
+                            cur = conn.cursor()
+                            cur.execute("UPDATE purchases SET status = 'delivered' WHERE id = ?", (order_id,))
+                            conn.commit()
+                            conn.close()
+                        except Exception as e:
+                            logging.error(f"Error delivering autodelivery for order {order_id}: {e}")
+                    else:
+                        # Если нет автодоставки, просто отмечаем как доставленный
+                        conn = sqlite3.connect(DB_PATH)
+                        cur = conn.cursor()
+                        cur.execute("UPDATE purchases SET status = 'delivered' WHERE id = ?", (order_id,))
+                        conn.commit()
+                        conn.close()
+                except Exception as e:
+                    logging.error(f"Error processing delivery for order {order_id}: {e}")
+            
+            # Проверяем каждые 5 секунд
+            await asyncio.sleep(5)
+        except Exception as e:
+            logging.error(f"Error in process_pending_deliveries: {e}")
+            await asyncio.sleep(5)
+
 async def main():
     init_db()
     ensure_promos_table()
     ensure_autodeliveries_table()
     ensure_payments_table()
     logging.info("Bot work...")
+    
+    # Запускаем фоновую задачу обработки доставок
+    delivery_task = asyncio.create_task(process_pending_deliveries())
+    
     try:
         await dp.start_polling(bot)
     except (asyncio.CancelledError, KeyboardInterrupt):
         logging.info("Polling cancelled / interrupted.")
+        delivery_task.cancel()
     except Exception:
         logging.exception("Unexpected error while polling:")
+        delivery_task.cancel()
     finally:
+        try:
+            delivery_task.cancel()
+        except Exception:
+            pass
+        
         try:
             if hasattr(dp, "shutdown"):
                 dp.shutdown()

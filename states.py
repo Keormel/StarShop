@@ -18,3 +18,10 @@ class PromoAdminState(StatesGroup):
 
 class UserPromoState(StatesGroup):
     waiting_for_code = State()
+
+class PurchaseState(StatesGroup):
+    waiting_for_promo = State()
+
+class DeleteState(StatesGroup):
+    waiting_for_category_name = State()
+    waiting_for_product_name = State()
