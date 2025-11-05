@@ -25,10 +25,16 @@ from db_helpers import (
     get_products_by_category, get_product_by_id, create_purchase, DB_PATH
 )
 
+logging.basicConfig(level=logging.INFO)
+
+# Initialize database BEFORE creating bot and dispatcher
+init_db()
+ensure_promos_table()
+ensure_autodeliveries_table()
+ensure_payments_table()
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-
-logging.basicConfig(level=logging.INFO)
 
 @dp.message(Command("start"))
 async def start_command(message: Message):
@@ -36,149 +42,6 @@ async def start_command(message: Message):
     uid = message.from_user.id if message.from_user else None
     keyboard = main_menu_keyboard(uid)
     await send_or_edit(bot, message.chat.id, message, text="Добро пожаловать! Выберите действие:", reply_markup=keyboard)
-
-@dp.message(Command("add_product"))
-async def add_product_command(message: Message, state: FSMContext):
-    await message.reply("Введите название категории для товара:")
-    await state.set_state(AddProductState.waiting_for_category)
-
-@dp.message(AddProductState.waiting_for_category)
-async def process_category(message: Message, state: FSMContext):
-    category_name = message.text.strip()
-    add_category(category_name)
-    categories = get_categories()
-    category_id = next((c[0] for c in categories if c[1] == category_name), None)
-    await state.update_data(category_id=category_id)
-    await message.reply("Введите название товара:")
-    await state.set_state(AddProductState.waiting_for_name)
-
-@dp.message(AddProductState.waiting_for_name)
-async def process_product_name(message: Message, state: FSMContext):
-    await state.update_data(name=message.text.strip())
-    await message.reply("Введите описание товара:")
-    await state.set_state(AddProductState.waiting_for_description)
-
-@dp.message(AddProductState.waiting_for_description)
-async def process_product_description(message: Message, state: FSMContext):
-    await state.update_data(description=message.text.strip())
-    await message.reply("Введите цену товара (целое число):")
-    await state.set_state(AddProductState.waiting_for_price)
-
-@dp.message(AddProductState.waiting_for_price)
-async def process_product_price(message: Message, state: FSMContext):
-    try:
-        price = int(message.text.strip())
-    except ValueError:
-        await message.reply("Цена должна быть числом. Попробуйте снова.")
-        return
-    await state.update_data(price=price)
-    await message.reply("Отправьте фотографию товара:")
-    await state.set_state(AddProductState.waiting_for_photo)
-
-@dp.message(AddProductState.waiting_for_photo, F.content_type == "photo")
-async def process_product_photo(message: Message, state: FSMContext):
-    photo = message.photo[-1]
-    photo_dir = "photos"
-    photo_path = os.path.join(photo_dir, f"{photo.file_id}.jpg")
-    os.makedirs(photo_dir, exist_ok=True)
-    file = await bot.get_file(photo.file_id)
-    await bot.download_file(file.file_path, destination=photo_path)
-
-    data = await state.get_data()
-    add_product(data["name"], data["description"], data["price"], data["category_id"], photo_path)
-
-    products = get_products_by_category(data["category_id"])
-    product_id = None
-    for p in products[::-1]:
-        pid = p[0]
-        pname = p[1]
-        pprice = p[3] if len(p) > 3 else None
-        pphoto = p[4] if len(p) > 4 else None
-        if pname == data["name"] and pprice == data["price"] and (pphoto == photo_path or pphoto is None):
-            product_id = pid
-            break
-
-    await message.reply(f"Товар '{data['name']}' добавлен. ID={product_id if product_id else 'неизвестен'}.")
-
-    if message.from_user and message.from_user.id in ADMIN_IDS:
-        if product_id:
-            await state.update_data(product_id=product_id)
-            await message.reply("Включить автовыдачу для этого товара? (да/нет)")
-            await state.set_state(AddProductState.waiting_for_autodelivery_choice)
-            return
-        else:
-            await send_admin_menu(message.chat.id, message)
-            await state.clear()
-            return
-    else:
-        await state.clear()
-        await send_main_menu(message.chat.id, message)
-
-@dp.message(AddProductState.waiting_for_autodelivery_choice)
-async def process_autodelivery_choice(message: Message, state: FSMContext):
-    ans = message.text.strip().lower()
-    data = await state.get_data()
-    product_id = data.get("product_id")
-    if not product_id:
-        await message.reply("Не удалось определить товар. Возвращаю в админ-панель.")
-        await state.clear()
-        await send_admin_menu(message.chat.id, message)
-        return
-
-    if ans in ("да", "yes", "y"):
-        await message.reply("Отправьте текстовое содержимое автовыдачи или файл (документ/фото).")
-        await state.set_state(AddProductState.waiting_for_autodelivery_content)
-        return
-    else:
-        create_autodelivery(product_id, 0, None, None)
-        await message.reply("Автовыдача отключена для этого товара.")
-        await state.clear()
-        await send_admin_menu(message.chat.id, message)
-
-@dp.message(AddProductState.waiting_for_autodelivery_content, F.content_type == "text")
-async def process_autodelivery_text(message: Message, state: FSMContext):
-    content = message.text.strip()
-    data = await state.get_data()
-    product_id = data.get("product_id")
-    if not product_id:
-        await message.reply("Не найден товар. Отмена.")
-        await state.clear()
-        await send_admin_menu(message.chat.id, message)
-        return
-    create_autodelivery(product_id, 1, content, None)
-    await message.reply("Автовыдача настроена (текст).")
-    await state.clear()
-    await send_admin_menu(message.chat.id, message)
-
-@dp.message(AddProductState.waiting_for_autodelivery_content, F.content_type.in_(["document", "photo"]))
-async def process_autodelivery_file(message: Message, state: FSMContext):
-    data = await state.get_data()
-    product_id = data.get("product_id")
-    if not product_id:
-        await message.reply("Не найден товар. Отмена.")
-        await state.clear()
-        await send_admin_menu(message.chat.id, message)
-        return
-
-    files_dir = "autodeliver_files"
-    os.makedirs(files_dir, exist_ok=True)
-    file_path = None
-
-    if message.content_type == "photo":
-        ph = message.photo[-1]
-        file = await bot.get_file(ph.file_id)
-        file_path = os.path.join(files_dir, f"{ph.file_id}.jpg")
-        await bot.download_file(file.file_path, destination=file_path)
-    elif message.content_type == "document":
-        doc = message.document
-        file = await bot.get_file(doc.file_id)
-        file_path = os.path.join(files_dir, f"{doc.file_id}_{doc.file_name}")
-        await bot.download_file(file.file_path, destination=file_path)
-
-    create_autodelivery(product_id, 1, None, file_path)
-    await message.reply("Автовыдача настроена (файл).")
-    await state.clear()
-    await send_admin_menu(message.chat.id, message)
 
 @dp.callback_query(F.data == "catalog")
 async def catalog_callback(callback: CallbackQuery):
@@ -214,36 +77,20 @@ async def category_callback(callback: CallbackQuery):
         await callback.answer()
         return
 
-    await show_product(callback, products, 0, category_id)
-
-async def show_product(callback: CallbackQuery, products, index, category_id):
-    product_id, name, description, price, photo_path = products[index]
-    text = f"🔹 <b>{name}</b>\n💬 {description}\n💰 Цена: {price} ₽"
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Предыдущий",
-                    callback_data=f"product_{category_id}_{index - 1}" if index > 0 else "disabled"
-                ),
-                InlineKeyboardButton(
-                    text="➡️ Следующий",
-                    callback_data=f"product_{category_id}_{index + 1}" if index < len(products) - 1 else "disabled"
-                )
-            ],
-            [
-                InlineKeyboardButton(text="🛒 Купить", callback_data=f"buy_{product_id}")
-            ],
-            [
-                InlineKeyboardButton(text="◀️ Назад", callback_data="start_command")
-            ]
-        ]
-    )
-
-    chat_id = callback.message.chat.id
-    await send_or_edit(bot, chat_id, callback, text=text, photo_path=photo_path, reply_markup=keyboard, parse_mode="HTML")
+    # Показываем все товары как кнопки
+    inline = []
+    for product_id, name, description, price, photo_path in products:
+        label = f" {name} — {price}₽"
+        inline.append([InlineKeyboardButton(text=label, callback_data=f"buy_{product_id}")])
+    inline.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=inline)
+    await send_or_edit(bot, callback.message.chat.id, callback, text="Товары в категории:", reply_markup=keyboard)
     await callback.answer()
+
+# Удалите или оставьте функцию show_product закомментированной, так как она больше не используется:
+# async def show_product(callback: CallbackQuery, products, index, category_id):
+#     ...
 
 @dp.callback_query(F.data.startswith("product_"))
 async def product_navigation_callback(callback: CallbackQuery):
@@ -277,15 +124,18 @@ async def handle_buy_callback(callback: CallbackQuery, state: FSMContext):
         await send_main_menu(callback.message.chat.id, callback)
         return
 
-    _, name, _, price = product
+    product_id, name, description, price = product
     await state.update_data(product_id=product_id, product_name=name, original_price=price)
+    
+    # Показываем информацию о товаре с фото
+    text = f" <b>{name}</b>\n💬 {description}\n💰 Цена: {price} ₽"
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Ввести промокод", callback_data="apply_promo_in_purchase")],
-        [InlineKeyboardButton(text="Оплатить без промокода", callback_data="skip_promo_purchase")]
+        [InlineKeyboardButton(text="Оплатить без промокода", callback_data="skip_promo_purchase")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")]
     ])
-    text = f"📦 {name}\n💰 Цена: {price} ₽\n\nХотите применить промокод?"
-    await send_or_edit(bot, callback.message.chat.id, callback, text=text, reply_markup=keyboard)
+    await send_or_edit(bot, callback.message.chat.id, callback, text=text, reply_markup=keyboard, parse_mode="HTML")
     await callback.answer()
 
 @dp.callback_query(F.data == "apply_promo_in_purchase")
@@ -371,7 +221,7 @@ async def process_promo_in_purchase(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_purchase_with_promo")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_purchase")]
     ])
-    text = f"✅ Промокод применён!\n\n📦 {product_name}\n💰 Исходная цена: {original_price} ₽\n🎟️ Скидка: -{amount} ₽\n💵 Итого: {final_price} ₽"
+    text = f"✅ Промокод применён!\n\n {product_name}\n💰 Исходная цена: {original_price} ₽\n🎟️ Скидка: -{amount} ₽\n💵 Итого: {final_price} ₽"
     await message.reply(text=text, reply_markup=keyboard)
 
 @dp.callback_query(F.data == "skip_promo_purchase")
@@ -752,7 +602,7 @@ async def category_info_callback(callback: CallbackQuery):
         return
     
     products = get_products_by_category(cat_id)
-    text = f"📁 Категория: {cat_name}\n📦 Товаров: {len(products)}"
+    text = f" Категория: {cat_name}\n Товаров: {len(products)}"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Удалить категорию", callback_data=f"delete_category_{cat_id}")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="list_categories")]
@@ -806,7 +656,7 @@ async def delete_category_callback(callback: CallbackQuery):
 async def manage_products_callback(callback: CallbackQuery):
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Добавить товар", callback_data="add_product_btn")],
+            [InlineKeyboardButton(text="Добавить товар", callback_data="add_product_menu")],
             [InlineKeyboardButton(text="Список товаров", callback_data="list_products")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_panel")]
         ]
@@ -814,11 +664,53 @@ async def manage_products_callback(callback: CallbackQuery):
     await send_or_edit(bot, callback.message.chat.id, callback, text="Управление товарами:", reply_markup=keyboard)
     await callback.answer()
 
-@dp.callback_query(F.data == "add_product_btn")
+@dp.callback_query(F.data == "add_product_menu")
 @admin_only
-async def add_product_btn_callback(callback: CallbackQuery, state: FSMContext):
-    await callback.message.reply("Используйте команду /add_product для добавления товара.")
+async def add_product_menu_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.message.reply("Введите название категории для товара:")
+    await state.set_state(AddProductState.waiting_for_category)
     await callback.answer()
+
+@dp.message(AddProductState.waiting_for_category)
+@admin_only
+async def process_category(message: Message, state: FSMContext):
+    category_name = message.text.strip()
+    add_category(category_name)
+    categories = get_categories()
+    category_id = next((c[0] for c in categories if c[1] == category_name), None)
+    await state.update_data(category_id=category_id)
+    await message.reply("Введите название товара:")
+    await state.set_state(AddProductState.waiting_for_name)
+
+@dp.message(AddProductState.waiting_for_name)
+@admin_only
+async def process_product_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text.strip())
+    await message.reply("Введите описание товара:")
+    await state.set_state(AddProductState.waiting_for_description)
+
+@dp.message(AddProductState.waiting_for_description)
+@admin_only
+async def process_product_description(message: Message, state: FSMContext):
+    await state.update_data(description=message.text.strip())
+    await message.reply("Введите цену товара (целое число):")
+    await state.set_state(AddProductState.waiting_for_price)
+
+@dp.message(AddProductState.waiting_for_price)
+@admin_only
+async def process_product_price(message: Message, state: FSMContext):
+    try:
+        price = int(message.text.strip())
+    except ValueError:
+        await message.reply("Цена должна быть числом. Попробуйте снова.")
+        return
+    
+    data = await state.get_data()
+    add_product(data["name"], data["description"], price, data["category_id"], None)
+    
+    await message.reply(f"✅ Товар '{data['name']}' добавлен.")
+    await state.clear()
+    await send_admin_menu(message.chat.id, message)
 
 @dp.callback_query(F.data == "list_products")
 @admin_only
@@ -829,11 +721,11 @@ async def list_products_callback(callback: CallbackQuery):
         await send_or_edit(bot, callback.message.chat.id, callback, text="Категорий не найдено.", reply_markup=keyboard)
         await callback.answer()
         return
-    
+
     inline = []
     for cat_id, cat_name in categories:
         products = get_products_by_category(cat_id)
-        inline.append([InlineKeyboardButton(text=f"📁 {cat_name} ({len(products)})", callback_data=f"cat_products_{cat_id}")])
+        inline.append([InlineKeyboardButton(text=f" {cat_name} ({len(products)})", callback_data=f"cat_products_{cat_id}")])
     inline.append([InlineKeyboardButton(text="◀️ Назад", callback_data="manage_products")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=inline)
     await send_or_edit(bot, callback.message.chat.id, callback, text="Выберите категорию:", reply_markup=keyboard)
@@ -858,7 +750,7 @@ async def cat_products_callback(callback: CallbackQuery):
     inline = []
     for prod in products:
         prod_id, name, description, price, photo_path = prod
-        label = f"📦 {name} — {price}₽"
+        label = f" {name} — {price}₽"
         inline.append([InlineKeyboardButton(text=label, callback_data=f"product_detail_{prod_id}")])
     inline.append([InlineKeyboardButton(text="◀️ Назад", callback_data="list_products")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=inline)
@@ -880,7 +772,7 @@ async def product_detail_callback(callback: CallbackQuery):
         return
     
     pid, name, description, price = product
-    text = f"📦 {name}\n\n{description}\n\n💰 Цена: {price}₽"
+    text = f" {name}\n\n{description}\n\n💰 Цена: {price}₽"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Удалить товар", callback_data=f"delete_product_{prod_id}")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="list_products")]
@@ -1022,6 +914,180 @@ async def start_command_callback(callback: CallbackQuery):
     await send_main_menu(callback.message.chat.id, callback)
     await callback.answer()
 
+@dp.callback_query(F.data == "profile")
+async def profile_callback(callback: CallbackQuery):
+    uid = callback.from_user.id if callback.from_user else None
+    text = f"👤 Ваш профиль\n\nID: {uid}\n\nЗдесь будет информация о вашем профиле."
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")]
+    ])
+    await send_or_edit(bot, callback.message.chat.id, callback, text=text, reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data == "support")
+async def support_callback(callback: CallbackQuery):
+    text = "💬 Служба поддержки\n\nhttps://t.me/grumpaaa\n\n"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")]
+    ])
+    await send_or_edit(bot, callback.message.chat.id, callback, text=text, reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data == "calculator")
+async def calculator_callback(callback: CallbackQuery):
+    text = "🧮 Калькулятор\n\nЭта функция в разработке."
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")]
+    ])
+    await send_or_edit(bot, callback.message.chat.id, callback, text=text, reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data == "faq")
+async def faq_callback(callback: CallbackQuery):
+    text = "❓ Часто задаваемые вопросы\n\n1. Как оплатить? — Выберите товар и следуйте инструкциям.\n2. Как получить товар? — Автоматическая доставка после оплаты."
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")]
+    ])
+    await send_or_edit(bot, callback.message.chat.id, callback, text=text, reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data == "delete_catalog")
+@admin_only
+async def delete_catalog_callback(callback: CallbackQuery):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить всё", callback_data="confirm_delete_catalog")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]
+    ])
+    text = "⚠️ ВНИМАНИЕ!\n\nВы собираетесь удалить весь каталог со всеми категориями и товарами.\n\nЭто действие необратимо!"
+    await send_or_edit(bot, callback.message.chat.id, callback, text=text, reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data == "confirm_delete_catalog")
+@admin_only
+async def confirm_delete_catalog_callback(callback: CallbackQuery):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA foreign_keys = OFF")
+        cur = conn.cursor()
+        
+        # Удаляем все автодоставки
+        cur.execute("DELETE FROM autodeliveries")
+        
+        # Удаляем все платежи и покупки
+        cur.execute("DELETE FROM payments")
+        cur.execute("DELETE FROM purchases")
+        
+        # Удаляем все товары
+        cur.execute("DELETE FROM products")
+        
+        # Удаляем все категории
+        cur.execute("DELETE FROM categories")
+        
+        conn.commit()
+        conn.close()
+        
+        await callback.answer("Каталог полностью удалён.")
+        await send_or_edit(bot, callback.message.chat.id, callback, text="✅ Каталог успешно удалён.")
+        await asyncio.sleep(1)
+        await send_admin_menu(callback.message.chat.id, callback)
+    except Exception as e:
+        logging.error(f"Error deleting catalog: {e}")
+        await callback.answer(f"Ошибка при удалении каталога: {str(e)}", show_alert=True)
+
+@dp.callback_query(F.data.startswith("checkpay_"))
+async def checkpay_callback(callback: CallbackQuery):
+    try:
+        payment_id = int(callback.data.split("_", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Ошибка при проверке платежа.", show_alert=True)
+        return
+    
+    try:
+        payment = get_payment_by_id(payment_id)
+        if not payment:
+            await callback.answer("Платёж не найден.", show_alert=True)
+            return
+        
+        # Распаковываем правильное количество значений
+        pid, purchase_id, invoice_id, pay_url, method, status = payment
+        
+        if status == "paid":
+            await callback.answer("✅ Платёж успешно проведён!", show_alert=True)
+            await send_or_edit(bot, callback.message.chat.id, callback, text="✅ Ваш платёж успешно принят. Спасибо за покупку! Ожидайте сообщение от поддержки.")
+            
+            # Отправляем информацию об заказе админам
+            await notify_admins_about_purchase(purchase_id, callback.from_user)
+            
+        elif status == "pending":
+            # Проверяем статус в Cryptopay
+            invoice_status = await check_crypto_invoice_status(invoice_id)
+            if invoice_status == "paid":
+                update_payment_status_by_id(payment_id, "paid")
+                await callback.answer("✅ Платёж успешно проведён!", show_alert=True)
+                await send_or_edit(bot, callback.message.chat.id, callback, text="✅ Ваш платёж успешно принят. Спасибо за покупку!")
+                
+                # Отправляем информацию об заказе админам
+                await notify_admins_about_purchase(purchase_id, callback.from_user)
+            else:
+                await callback.answer("⏳ Платёж ещё не поступил. Попробуйте позже.", show_alert=True)
+        else:
+            await callback.answer("❌ Платёж отклонен или отменен.", show_alert=True)
+    except Exception as e:
+        logging.error(f"Error checking payment: {e}")
+        await callback.answer(f"Ошибка при проверке платежа: {str(e)}", show_alert=True)
+
+async def notify_admins_about_purchase(purchase_id: int, user):
+    """
+    Отправляет информацию об заказе всем администраторам.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        
+        # Получаем информацию о покупке
+        cur.execute("SELECT user_id, product_id FROM purchases WHERE id = ?", (purchase_id,))
+        purchase_row = cur.fetchone()
+        
+        if not purchase_row:
+            conn.close()
+            return
+        
+        user_id, product_id = purchase_row
+        
+        # Получаем информацию о товаре
+        product = get_product_by_id(product_id)
+        if not product:
+            conn.close()
+            return
+        
+        _, product_name, _, price = product
+        
+        conn.close()
+        
+        # Формируем сообщение для админов
+        user_first_name = user.first_name or "Unknown"
+        user_username = f"@{user.username}" if user.username else "Нет юзернейма"
+        user_telegram_id = user.id
+        
+        admin_message = (
+            f"📦 <b>Новый заказ #{purchase_id}</b>\n\n"
+            f"<b>Товар:</b> {product_name}\n"
+            f"<b>Цена:</b> {price} ₽\n\n"
+            f"<b>Информация о покупателе:</b>\n"
+            f"<b>Имя:</b> {user_first_name}\n"
+            f"<b>Юзернейм:</b> {user_username}\n"
+            f"<b>Telegram ID:</b> <code>{user_telegram_id}</code>"
+        )
+        
+        # Отправляем сообщение всем администраторам
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(chat_id=admin_id, text=admin_message, parse_mode="HTML")
+            except Exception as e:
+                logging.error(f"Error sending admin notification to {admin_id}: {e}")
+    except Exception as e:
+        logging.error(f"Error in notify_admins_about_purchase: {e}")
+
 async def send_main_menu(chat_id: int, source_obj):
     uid = None
     try:
@@ -1122,11 +1188,8 @@ async def process_pending_deliveries():
             await asyncio.sleep(5)
 
 async def main():
-    init_db()
-    ensure_promos_table()
-    ensure_autodeliveries_table()
-    ensure_payments_table()
-    logging.info("Bot work...")
+    logging.info("Bot started...")
+    logging.info(f"Using database: {DB_PATH}")
     
     # Запускаем фоновую задачу обработки доставок
     delivery_task = asyncio.create_task(process_pending_deliveries())
